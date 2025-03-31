@@ -1684,14 +1684,19 @@ class PyExecutor:
             hidden_states = spec_metadata.get_hidden_states(
                 draft_batch, num_rejected_tokens)
 
-            extra_model_inputs = {'hidden_states': hidden_states}
-
             if spec_metadata.spec_dec_mode.is_eagle3():
-                # Another eagle3 hack. Eagle3 checkpoints don't have embed_tokens,
-                # so we need to provide them some other way. We can get rid of this
-                # hack if we provide our own preprocessed eagle3 checkpoints.
-                extra_model_inputs[
-                    'embed_tokens'] = self.model_engine.model.model.embed_tokens
+                hidden_states = hidden_states.to(
+                    self.draft_model_engine.model.model.dtype)
+                # Hack for eagle3. We might need to run a matmul to reduce
+                # the dimensionality of the hidden states on the first pass
+                # through the draft model. Shape dependent control flow will
+                # not work with CUDA graphs. So we just do it here.
+                expected_hidden_size = self.draft_model_engine.model.model.hidden_size
+                fc = self.draft_model_engine.model.model.fc
+                if hidden_states.shape[-1] != expected_hidden_size:
+                    hidden_states = fc(hidden_states)
+
+            extra_model_inputs = {'hidden_states': hidden_states}
 
             outputs = self.draft_model_engine.forward(
                 draft_batch,
@@ -1731,10 +1736,6 @@ class PyExecutor:
                 hidden_states = draft_spec_metadata.get_hidden_states(
                     draft_batch)
                 extra_model_inputs = {'hidden_states': hidden_states}
-                if spec_metadata.spec_dec_mode.is_eagle3():
-                    # See note above.
-                    extra_model_inputs[
-                        'embed_tokens'] = self.model_engine.model.model.embed_tokens
 
                 outputs = self.draft_model_engine.forward(
                     draft_batch,
