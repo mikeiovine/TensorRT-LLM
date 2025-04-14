@@ -189,6 +189,8 @@ class TorchDecoder(Decoder):
     def __init__(self, max_seq_len: int, mixed_decoder: bool = False):
         self.max_seq_len = max_seq_len
         self.mixed_decoder = mixed_decoder
+        self.na = 0
+        self.nd = 0
 
     def setup_decoder(self, scheduled_requests: ScheduledRequests,
                       model_outputs):
@@ -287,12 +289,14 @@ class TorchDecoder(Decoder):
 
                 # Accept draft tokens (if we have any) if and only if they match the new
                 # token exactly.
+                self.nd += len(request.py_draft_tokens)
                 for i in range(len(request.py_draft_tokens)):
                     draft_token = request.py_draft_tokens[i]
                     if draft_token != new_token:
                         # Reject.
                         break
 
+                    self.na += 1
                     num_accepted += 1
                     new_token = new_tokens_list[idx + i + 1]
                     num_tokens = request.add_new_token(new_token, beam_idx)
@@ -300,6 +304,7 @@ class TorchDecoder(Decoder):
                     if self._handle_stop_criteria(request, new_token,
                                                   num_tokens, beam_idx):
                         break
+            print(self.na / self.nd)
             request.py_num_accepted_draft_tokens = num_accepted
             request.py_rewind_len = request.py_draft_pages_allocated - num_accepted
             idx += len(request.py_draft_tokens) + 1

@@ -525,6 +525,7 @@ class DecoderModelForCausalLM(nn.Module,
                                  desc="Loading weights"):
             if len(module._parameters) > 0:
                 # skip load weights if tie word embeddings is enabled and layer is lm_head
+                print("LOAD", name)
                 if self.config.tie_word_embeddings and name.startswith(
                         "lm_head"):
                     continue

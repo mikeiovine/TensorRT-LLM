@@ -40,7 +40,8 @@ class LlamaRotaryEmbedding(RotaryEmbedding):
             num_attention_heads=config.num_attention_heads,
             max_position_embeddings=config.max_position_embeddings,
             device=device,
-            rope_type="default" if config.rope_scaling is None else "llama3")
+            rope_type="default"
+            if getattr(config, "rope_scaling", None) is None else "llama3")
 
 
 class LlamaAttention(Attention):
@@ -76,7 +77,7 @@ class LlamaAttention(Attention):
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
-            bias=config.attention_bias,
+            bias=getattr(config, "attention_bias", False),
             rotary_emb=LlamaRotaryEmbedding(config),
             pos_embd_params=pos_embd_params,
             layer_idx=layer_idx,
@@ -396,7 +397,7 @@ class Eagle3LlamaAttention(LlamaAttention):
         self.qkv_proj = Linear(
             2 * self.hidden_size,
             tp_size * self.q_size + 2 * tp_size * self.kv_size,
-            bias=config.attention_bias,
+            bias=getattr(config, "attention_bias", False),
             dtype=config.torch_dtype,
             parallel_config=ParallelConfig(
                 tensor_parallel_size=tp_size,
@@ -428,10 +429,15 @@ class Eagle3LlamaDecoderLayer(DecoderLayer):
             layer_idx=layer_idx,
         )
 
+        if config.model_type == "llama4_text":
+            inter_size = config.intermediate_size_mlp
+        else:
+            inter_size = config.intermediate_size
+
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            bias=config.mlp_bias,
+            intermediate_size=inter_size,
+            bias=getattr(config, "mlp_bias", False),
             dtype=config.torch_dtype,
             config=model_config,
         )
@@ -645,14 +651,10 @@ class Eagle3LlamaDraftModel(DecoderModel):
 
         self.fc = Linear(self.hidden_size_in * 3,
                          config.hidden_size,
-                         bias=False,
+                         bias=getattr(config, "bias", False),
                          dtype=config.torch_dtype)
 
         self.midlayer = Eagle3LlamaDecoderLayer(model_config, 0)
-
-        self.norm = RMSNorm(hidden_size=config.hidden_size,
-                            eps=config.rms_norm_eps,
-                            dtype=config.torch_dtype)
 
         self.d2t = nn.Parameter(torch.empty((config.draft_vocab_size, ),
                                             dtype=torch.int64),
@@ -707,11 +709,9 @@ class Eagle3LlamaDraftModel(DecoderModel):
                                                 hidden_states=hidden_states,
                                                 attn_metadata=attn_metadata)
 
-        hidden_states, hidden_states_to_save = self.norm(
-            hidden_states, residual)
         assert isinstance(spec_metadata, Eagle3SpecMetadata)
-        spec_metadata.hidden_states.append(hidden_states_to_save)
-        return hidden_states
+        spec_metadata.hidden_states.append(hidden_states)
+        return hidden_states + residual
 
 
 @register_auto_model("EAGLE3LlamaForCausalLM")
@@ -722,6 +722,13 @@ class Eagle3LlamaForCausalLM(DecoderModelForCausalLM[Eagle3LlamaDraftModel,
         self,
         model_config: ModelConfig[LlamaConfig],
     ):
+        model_config = copy.copy(model_config)
+        from transformers.configuration_utils import PretrainedConfig
+        model_config.pretrained_config = PretrainedConfig(
+            **model_config.pretrained_config.eagle)
+        model_config.pretrained_config.tie_word_embeddings = False
+        model_config.pretrained_config.torch_dtype = torch.bfloat16
+
         super().__init__(
             Eagle3LlamaDraftModel(model_config),
             config=model_config,
