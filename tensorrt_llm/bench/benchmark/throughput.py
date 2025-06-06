@@ -356,6 +356,17 @@ def throughput_command(
         kwargs = kwargs | runtime_config.get_llm_args()
         kwargs['backend'] = backend
 
+        from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig)
+        kwargs['disable_overlap_scheduler'] = True
+        kwargs['speculative_config'] = EagleDecodingConfig(
+            max_draft_len=2,
+            pytorch_eagle_weights_path=
+            '/home/miovine/models/EAGLE3-LLaMA3.1-Instruct-8B',
+            eagle3_one_model=False)
+        kwargs['kv_cache_config'] = KvCacheConfig(enable_block_reuse=False)
+        kwargs['max_batch_size'] = 8
+        # kwargs['max_num_tokens'] = 4096 * 5
+
         if backend == "pytorch" and iteration_log is not None:
             kwargs["enable_iter_perf_stats"] = True
 

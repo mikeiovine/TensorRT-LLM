@@ -1867,10 +1867,10 @@ class PyExecutor:
                     target_model_req = req_id_to_old_request[req.py_request_id]
                     target_model_req.py_draft_tokens.append(
                         req.get_last_tokens(0))
-                    if req.state != LlmRequestState.GENERATION_COMPLETE and len(
-                            target_model_req.py_draft_tokens
-                    ) < target_model_req.py_draft_pages_allocated:
-                        new_requests.append(req)
+                    # if req.state != LlmRequestState.GENERATION_COMPLETE and len(
+                    #         target_model_req.py_draft_tokens
+                    # ) < target_model_req.py_draft_pages_allocated:
+                    new_requests.append(req)
 
                 return new_requests
 
@@ -1892,16 +1892,20 @@ class PyExecutor:
             draft_batch.generation_requests = new_requests
             draft_batch.context_requests = []
 
+            start_size = len(new_requests)
             for _ in range(spec_metadata.max_draft_tokens - 1):
                 draft_spec_metadata = self.draft_model_engine.last_spec_metadata
                 hidden_states = draft_spec_metadata.get_hidden_states(
                     draft_batch)
                 extra_model_inputs = {'hidden_states': hidden_states}
 
-                outputs = self.draft_model_engine.forward(
-                    draft_batch,
-                    self.resource_manager,
-                    extra_model_inputs=extra_model_inputs)
+                try:
+                    outputs = self.draft_model_engine.forward(
+                        draft_batch,
+                        self.resource_manager,
+                        extra_model_inputs=extra_model_inputs)
+                except Exception as e:
+                    raise ValueError(f"Batch {draft_batch.batch_size}")
 
                 if spec_metadata.spec_dec_mode.is_eagle3() and hasattr(
                         self.draft_model_engine.model.model, 'd2t'):

@@ -416,7 +416,7 @@ class PyTorchModelEngine(ModelEngine):
         self._cuda_graph_padding_enabled = pytorch_backend_config.cuda_graph_padding_enabled
         self._cuda_graph_batch_sizes = [
             bs for bs in pytorch_backend_config.cuda_graph_batch_sizes
-            if bs <= self.max_num_tokens and bs <= self.batch_size
+            if bs * 4 <= self.max_num_tokens and bs <= self.batch_size
         ]
         self._max_cuda_graph_batch_size = self._cuda_graph_batch_sizes[-1]
 
@@ -674,7 +674,7 @@ class PyTorchModelEngine(ModelEngine):
                                         bs, num_tokens_per_request))
                                 torch.cuda.synchronize()
 
-            if self.pytorch_backend_config.autotuner_enabled:
+            if False and self.pytorch_backend_config.autotuner_enabled:
                 with no_cuda_graph(), autotune():
                     result, extra_model_inputs = get_autotune_warmup_request()
                     with release_batch(result) as batch:

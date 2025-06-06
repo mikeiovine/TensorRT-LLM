@@ -1,4 +1,5 @@
 import argparse
+import time
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
@@ -200,12 +201,23 @@ def main():
     prompts = args.prompt if args.prompt else example_prompts
 
     llm, sampling_params = setup_llm(args)
-    outputs = llm.generate(prompts, sampling_params)
+    prompt_ids = [
+        llm.tokenizer.apply_chat_template([{
+            "role": "user",
+            "content": prompt
+        }],
+                                          add_generation_prompt=True)
+        for prompt in prompts
+    ]
+    start = time.time()
+    outputs = llm.generate(prompt_ids, sampling_params)
 
     for i, output in enumerate(outputs):
         prompt = output.prompt
         generated_text = output.outputs[0].text
         print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
+    end = time.time()
+    print(f"e2e time {end - start}")
 
 
 if __name__ == '__main__':

@@ -3,6 +3,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 
+from tensorrt_llm.logger import logger
 from ..attention_backend.interface import AttentionMetadata
 from ..speculative.interface import SpecMetadata
 from ..utils import make_weak_ref, set_piecewise_cuda_graph_flag
@@ -98,6 +99,8 @@ class DecodingCUDAGraphRunner:
             for key, tensor in extra_model_inputs.items():
                 new_tensor = tensor.clone()
                 inputs[key] = new_tensor
+                logger.info("Capture hidden states with size",
+                            new_tensor.size())
                 self.extra_model_inputs[key] = new_tensor
 
         # We have to do warm up runs to initialize PyTorch's
@@ -150,7 +153,8 @@ class DecodingCUDAGraphRunner:
             for key in self.extra_model_inputs:
                 assert key in extra_model_inputs, f"Graph runner is missing extra input {key}"
                 dst_tensor = self.extra_model_inputs[key]
-                dst_tensor.copy_(extra_model_inputs[key])
+                dst_tensor[:extra_model_inputs[key].size(0)].copy_(
+                    extra_model_inputs[key])
 
         assert self._output is not None and self._graph is not None
         self._graph.replay()
