@@ -168,6 +168,9 @@ def setup_llm(args, **kwargs):
         spec_config = EagleDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
             speculative_model_dir=args.draft_model_dir,
+            dynamic_tree_max_topK=3,
+            dynamic_tree_max_num_tokens=5,
+            use_dynamic_tree=True,
             eagle3_one_model=args.use_one_model)
     elif spec_decode_algo == "DRAFT_TARGET":
         spec_config = DraftTargetDecodingConfig(

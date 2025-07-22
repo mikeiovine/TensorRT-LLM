@@ -280,11 +280,6 @@ class DecodingBaseConfig(BaseModel):
         """
         return True
 
-    def validate(self) -> None:
-        """
-        Do any additional error checking here.
-        """
-
     @functools.cached_property
     def spec_dec_mode(self):
         # spec_dec_mode has more functionality than the raw decoding_mode string.
@@ -301,6 +296,18 @@ class DecodingBaseConfig(BaseModel):
     def get_draft_model_prompt(self,
                                input_tokens: torch.Tensor) -> torch.Tensor:
         return input_tokens
+
+    @property
+    def max_total_draft_tokens(self) -> int:
+        """
+        This property is used internally for allocating KV cache space, buffers
+        for CUDA graphs, etc.
+
+        For the majority of simple speculation algorithms, it should be equal to
+        the max draft length. It can differ for algorithms that support trees like
+        EAGLE3.
+        """
+        return self.max_draft_len
 
 
 class MedusaDecodingConfig(DecodingBaseConfig):
@@ -326,16 +333,13 @@ class EagleDecodingConfig(DecodingBaseConfig):
     num_eagle_layers: Optional[int] = None
     max_non_leaves_per_layer: Optional[int] = None
     eagle3_one_model: Optional[bool] = True
+    dynamic_tree_max_num_tokens: Optional[int] = None
 
     @classmethod
     def from_dict(cls, data: dict):
         return cls(**data)
 
     decoding_type: ClassVar[str] = "Eagle"
-
-    def validate(self) -> None:
-        if self.speculative_model_dir is None:
-            raise ValueError("Draft model must be provided for EAGLE")
 
     @functools.cached_property
     def spec_dec_mode(self):
@@ -351,6 +355,12 @@ class EagleDecodingConfig(DecodingBaseConfig):
         Eagle3 always throws away the first token when processing draft inputs
         """
         return input_tokens[1:]
+
+    @property
+    def max_total_draft_tokens(self) -> int:
+        if self.use_dynamic_tree:
+            return self.dynamic_tree_max_num_tokens
+        return self.max_draft_len
 
 
 class UserProvidedDecodingConfig(DecodingBaseConfig):
@@ -1466,6 +1476,22 @@ class BaseLlmArgs(BaseModel):
             elif isinstance(self.speculative_config, EagleDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
                 assert self.speculative_config.speculative_model_dir is not None, "Path to EAGLE3 weights must be specified."
+
+                if self.speculative_config.use_dynamic_tree:
+                    if self.speculative_config.eagle3_one_model:
+                        raise ValueError(
+                            "One-model EAGLE does not support dynamic trees")
+
+                    if self.speculative_config.dynamic_tree_max_topK is None:
+                        raise ValueError(
+                            "Please specify a value for dynamic_tree_max_topk to use dynamic trees"
+                        )
+
+                    if self.speculative_config.dynamic_tree_max_num_tokens is None:
+                        raise ValueError(
+                            "Please specify a value for dynamic_tree_max_num_tokens to use dynamic trees"
+                        )
+
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.EAGLE
                 if self.speculative_config.eagle3_one_model:
