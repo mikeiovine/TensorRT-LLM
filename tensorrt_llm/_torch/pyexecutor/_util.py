@@ -820,8 +820,8 @@ def create_py_executor_instance(
         virtual_memory_pools=virtual_memory_pools)
 
 
-def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
-                              max_batch_size: int,
+def create_torch_sampler_args(mapping: Mapping, *, model_config: ModelConfig,
+                              max_seq_len: int, max_batch_size: int,
                               speculative_config: SpeculativeConfig,
                               max_beam_width: int,
                               disable_flash_infer_sampling: bool):
@@ -831,6 +831,10 @@ def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
     max_total_draft_tokens = (0 if speculative_config is None else
                               speculative_config.max_total_draft_tokens)
 
+    is_ssm = is_nemotron_hybrid(
+        model_config.pretrained_config) or is_qwen3_next(
+            model_config.pretrained_config)
+
     return TorchSampler.Args(
         max_seq_len=max_seq_len,
         max_draft_len=max_draft_len,
@@ -838,7 +842,7 @@ def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
         max_num_sequences=max_num_sequences,
         max_beam_width=max_beam_width,
         disable_flash_infer_sampling=disable_flash_infer_sampling,
-    )
+        disable_spec_decode_rewind=is_ssm)
 
 
 def instantiate_sampler(
@@ -857,6 +861,7 @@ def instantiate_sampler(
 ):
     sampler_args = create_torch_sampler_args(
         mapping,
+        model_config=engine.model.model_config,
         max_seq_len=engine.max_seq_len,
         max_batch_size=max_batch_size,
         speculative_config=speculative_config,

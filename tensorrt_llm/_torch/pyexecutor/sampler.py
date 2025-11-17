@@ -617,11 +617,22 @@ class TorchSampler(Sampler):
         max_total_draft_tokens: int
         disable_flash_infer_sampling: bool = False
 
+        # For hybrid/SSM models. It's not trivial to rewind hidden states for
+        # these models. We have two cases:
+        # 1. All draft tokens accepted. No need for rewinding.
+        # 2. Less than the max draft length was accepted. In this case we'll just send all
+        # accepted draft tokens (if any) back through the forward pass again to recompute the
+        # correct hidden states. In hybrid models, attention layers will be rewinded completely
+        # before this occurs.
+        disable_spec_decode_rewind: bool = False
+
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
         self.max_tokens = args.max_total_draft_tokens + 1
         assert args.max_beam_width == MAX_BEAM_WIDTH, "TorchSampler only supports beam_width = 1"
         self.max_num_sequences = args.max_num_sequences
+
+        self.disable_spec_decode_rewind = args.disable_spec_decode_rewind
 
         # AutoDeploy build creates the sampler in inference mode,
         # which would disallow in-place mutating of new_tokens.
@@ -785,7 +796,7 @@ class TorchSampler(Sampler):
         num_accepted = 0
 
         for draft_token in request.py_draft_tokens:
-            if draft_token != new_token:
+            if True or draft_token != new_token:
                 # Reject.
                 break
 
@@ -1120,7 +1131,13 @@ class TorchSampler(Sampler):
             if get_draft_token_length(req) > 0:
                 req.py_num_accepted_draft_tokens = num_accepted
                 actual_draft_len = get_draft_token_length(req)
-                req.py_rewind_len = actual_draft_len - num_accepted
+
+                if self.disable_spec_decode_rewind:
+                    req.py_rewind_len = (
+                        actual_draft_len if num_accepted < req.py_draft_pages_allocated else 0
+                    )
+                else:
+                    req.py_rewind_len = actual_draft_len - num_accepted
             else:
                 req.py_num_accepted_draft_tokens = 0
                 req.py_rewind_len = 0
