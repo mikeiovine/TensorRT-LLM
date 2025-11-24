@@ -1472,27 +1472,49 @@ class PyTorchModelEngine(ModelEngine):
             # (2) a dummy request; or
             # (3) the first step in the generation server of disaggregated serving
             if next_draft_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
+                # For mamba hybrid models with speculative decoding, check if there
+                # are tokens that need to be reprocessed through mamba layers
+                tokens_to_reprocess = []
+                if hasattr(kv_cache_manager, 'get_tokens_to_reprocess'):
+                    tokens_to_reprocess = kv_cache_manager.get_tokens_to_reprocess(
+                        request.py_request_id)
+
                 # get token ids, including input token ids and draft token ids. For these dummy requests,
                 # no need to copy the token ids.
                 if not (request.is_attention_dp_dummy
                         or request.is_cuda_graph_dummy):
-                    input_ids.append(request.get_last_tokens(0))
+                    if tokens_to_reprocess:
+                        # Include all tokens that need reprocessing for mamba state update
+                        # These are the accepted tokens from the previous iteration
+                        input_ids.extend(tokens_to_reprocess)
+                    else:
+                        # Standard case: just the last token
+                        input_ids.append(request.get_last_tokens(0))
                     input_ids.extend(request.py_draft_tokens)
                     draft_tokens.extend(request.py_draft_tokens)
+
                 # get other ids and lengths
                 num_draft_tokens = get_draft_token_length(request)
                 past_seen_token_num = request.max_beam_num_tokens - 1
+
+                # Adjust for tokens being reprocessed
+                num_reprocess = len(tokens_to_reprocess) if tokens_to_reprocess else 1
+                num_input_tokens = num_reprocess + num_draft_tokens
+
                 draft_lens.append(num_draft_tokens)
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend) and spec_config.is_linear_tree:
                     # We're treating the prompt lengths as context requests here, so
                     # the the prompt lens should not include the cached tokens.
-                    prompt_lengths.append(1 + num_draft_tokens)
+                    prompt_lengths.append(num_input_tokens)
                 else:
                     prompt_lengths.append(request.py_prompt_len)
 
-                sequence_lengths.append(1 + num_draft_tokens)
+                sequence_lengths.append(num_input_tokens)
                 num_accepted_draft_tokens.append(num_draft_tokens)
+
+                # Calculate position range for reprocessed tokens + draft tokens
+                reprocess_start_pos = past_seen_token_num - (num_reprocess - 1)
                 gather_ids.extend(
                     list(
                         range(len(position_ids),
@@ -1509,9 +1531,11 @@ class PyTorchModelEngine(ModelEngine):
                 else:
                     position_ids.extend(
                         list(
-                            range(past_seen_token_num,
-                                  past_seen_token_num + 1 + num_draft_tokens)))
-                num_cached_tokens_per_seq.append(past_seen_token_num)
+                            range(reprocess_start_pos,
+                                reprocess_start_pos + num_input_tokens)))
+
+                # Cache tracking should reflect the actual cache state (before reprocessing)
+                num_cached_tokens_per_seq.append(reprocess_start_pos)
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
                 # update batch index
                 request.py_batch_idx = request.py_seq_slot
@@ -1615,6 +1639,14 @@ class PyTorchModelEngine(ModelEngine):
         for request in generation_requests:
             request_ids.append(request.py_request_id)
             beam_width = request.sampling_config.beam_width
+
+            # For mamba hybrid models with speculative decoding, check if there
+            # are tokens that need to be reprocessed through mamba layers
+            tokens_to_reprocess = []
+            if hasattr(kv_cache_manager, 'get_tokens_to_reprocess'):
+                tokens_to_reprocess = kv_cache_manager.get_tokens_to_reprocess(
+                    request.py_request_id)
+
             for beam in range(beam_width):
                 # the request has no previous tensor:
                 # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
@@ -1633,6 +1665,10 @@ class PyTorchModelEngine(ModelEngine):
                                 request.py_request_id].py_seq_slot
                             first_draft_input_ids_positions.append(
                                 (start_idx, end_idx, slot_idx))
+                        elif tokens_to_reprocess and beam == 0:
+                            # Include all tokens that need reprocessing for mamba state update
+                            # Only do this for beam 0 to avoid duplicates
+                            input_ids.extend(tokens_to_reprocess)
                         else:
                             input_ids.append(request.get_last_tokens(beam))
                     past_seen_token_num = request.max_beam_num_tokens - 1
@@ -1644,20 +1680,37 @@ class PyTorchModelEngine(ModelEngine):
                     if beam == first_beam:
                         previous_batch_indices.append(request.py_batch_idx)
                     past_seen_token_num = request.max_beam_num_tokens
-                position_id = past_seen_token_num
+
+                # Adjust for tokens being reprocessed (only for beam 0, non-dummy requests)
+                num_reprocess = 1
+                if tokens_to_reprocess and beam == 0 and not request.is_cuda_graph_dummy:
+                    num_reprocess = len(tokens_to_reprocess)
+
+                reprocess_start_pos = past_seen_token_num - (num_reprocess - 1)
+                position_id = reprocess_start_pos if num_reprocess > 1 else past_seen_token_num
                 if self.mapping.has_cp_helix():
                     # Do an allgather among CP ranks to get the complete sequence length seen by all CP ranks.
                     past_seen_token_nums = self.dist.cp_allgather(
                         past_seen_token_num)
                     position_id = sum(past_seen_token_nums)
-                position_ids.append(position_id)
-                num_cached_tokens_per_seq.append(past_seen_token_num)
+
+                if num_reprocess > 1:
+                    position_ids.extend(
+                        list(range(reprocess_start_pos, reprocess_start_pos + num_reprocess)))
+                else:
+                    position_ids.append(position_id)
+
+                num_cached_tokens_per_seq.append(reprocess_start_pos)
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
                 prompt_lengths.append(request.py_prompt_len)
                 draft_lens.append(0)
-                sequence_lengths.append(1)
+                sequence_lengths.append(num_reprocess)
                 num_accepted_draft_tokens.append(0)
-                gather_ids.append(len(position_ids) - 1)
+                if num_reprocess > 1:
+                    gather_ids.extend(
+                        list(range(len(position_ids) - num_reprocess, len(position_ids))))
+                else:
+                    gather_ids.append(len(position_ids) - 1)
 
                 # Multimodal
                 multimodal_params = MultimodalParams(
