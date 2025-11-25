@@ -215,19 +215,13 @@ class MambaCacheManager(BaseResourceManager):
                         self._saved_state_slots[request_id] = state_slot
                         slots_to_save.append(state_slot)
 
-        # Batch copy the states for newly tracked requests
-        if slots_to_save:
-            slots_tensor = torch.tensor(slots_to_save,
-                                        dtype=torch.long,
-                                        device=self.conv_states.device)
-
             # Save conv states: [num_layers, batch, conv_dim, d_conv-1]
-            self._saved_conv_states[:, slots_tensor].copy_(
-                self.conv_states[:, slots_tensor])
+            for slot in slots_to_save:
+                self._saved_conv_states[:, slot].copy_(self.conv_states[:,
+                                                                        slot])
 
-            # Save ssm states: [num_layers, batch, nheads, head_dim, d_state]
-            self._saved_ssm_states[:, slots_tensor].copy_(
-                self.ssm_states[:, slots_tensor])
+                # Save ssm states: [num_layers, batch, nheads, head_dim, d_state]
+                self._saved_ssm_states[:, slot].copy_(self.ssm_states[:, slot])
 
     def _restore_mamba_state_for_spec_dec(
             self, scheduled_batch: ScheduledRequests) -> None:
@@ -272,18 +266,11 @@ class MambaCacheManager(BaseResourceManager):
                     accepted_tokens = all_tokens[-num_accepted:]
                     self._tokens_to_reprocess[request_id] = accepted_tokens
 
-        if slots_to_restore:
-            slots_tensor = torch.tensor(slots_to_restore,
-                                        dtype=torch.long,
-                                        device=self.conv_states.device)
-
+        for slot in slots_to_restore:
             # Restore conv states
-            self.conv_states[:, slots_tensor].copy_(
-                self._saved_conv_states[:, slots_tensor])
-
+            self.conv_states[:, slot].copy_(self._saved_conv_states[:, slot])
             # Restore ssm states
-            self.ssm_states[:, slots_tensor].copy_(
-                self._saved_ssm_states[:, slots_tensor])
+            self.ssm_states[:, slot].copy_(self._saved_ssm_states[:, slot])
 
         # Remove processed entries from saved state tracking
         for rid in request_ids_to_remove:
