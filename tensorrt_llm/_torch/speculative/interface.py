@@ -12,6 +12,7 @@ from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version
 from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..pyexecutor.resource_manager import BaseResourceManager
 
 if TYPE_CHECKING:
@@ -162,6 +163,17 @@ class SpeculativeDecodingMode(IntEnum):
         """
         is_trtllm_attention = issubclass(attention_backend, TrtllmAttention)
 
+        # Check if using FlashInfer backend
+        is_flashinfer_attention = False
+        if IS_FLASHINFER_AVAILABLE:
+            from ..attention_backend.flashinfer import FlashInferAttention
+            is_flashinfer_attention = issubclass(attention_backend,
+                                                 FlashInferAttention)
+
+        # For 1-model with FlashInfer, always enable spec-dec mode since we use
+        # prefill kernels for verification (decode kernels don't support seq_len > 1)
+        use_case_flashinfer = self.use_one_engine() and is_flashinfer_attention
+
         # Always use the multi-token query mode for 1-model if the kernels are available.
         xqa_supported = get_sm_version() < 120
         use_case_1 = self.use_one_engine() and xqa_supported
@@ -173,7 +185,7 @@ class SpeculativeDecodingMode(IntEnum):
              and spec_resource_manager.is_first_draft
              and use_chain_drafter)) and is_trtllm_attention
 
-        return use_case_1 or use_case_2
+        return use_case_1 or use_case_2 or use_case_flashinfer
 
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":

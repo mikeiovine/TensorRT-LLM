@@ -458,8 +458,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 attn_metadata.on_update()
                 # cannot run generation if their is no kv cache
                 if inputs["attn_metadata"].kv_cache_manager is not None:
-                    attn_metadata.host_request_types[:attn_metadata.
-                                                     num_contexts].fill_(1)
+                    if hasattr(attn_metadata, "host_request_types"):
+                        attn_metadata.host_request_types[:attn_metadata.
+                                                         num_contexts].fill_(1)
                     attn_metadata.num_contexts = 0
                 # update kv_lens_cuda
                 if hasattr(attn_metadata, 'kv_lens_cuda'):

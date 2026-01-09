@@ -255,6 +255,7 @@ class Eagle3DraftModel(DecoderModel):
         super().__init__(model_config)
 
         config = model_config.pretrained_config
+        config.max_position_embeddings = 131072
         eagle_config = config.eagle_config if hasattr(config,
                                                       "eagle_config") else {}
         self.spec_config = model_config.spec_config

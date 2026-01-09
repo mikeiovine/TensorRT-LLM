@@ -9,12 +9,19 @@ import torch
 from flashinfer.jit.core import check_cuda_arch
 from typing_extensions import Self
 
+from typing import TYPE_CHECKING
+
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import get_global_attrs, get_model_extra_attrs
 from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
                         CustomAttentionMask, PredefinedAttentionMask)
+
+if TYPE_CHECKING:
+    from ..speculative.interface import SpecMetadata
+    from ..speculative.spec_tree_manager import SpecTreeManager
+    from ..speculative.utils import SpecDecodingTensor
 
 try:
     check_cuda_arch()
@@ -71,6 +78,23 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
     _plan_params_to_wrappers: Dict[PlanParams,
                                    FlashInferWrappers] = field(init=False)
+
+    # Spec decoding fields
+    # is_spec_decoding_enabled specifies if spec-dec mode is supported for the entire runtime.
+    is_spec_decoding_enabled: bool = False
+    # use_spec_decoding determines if the attention layer should be run in spec-dec mode at the specific step / layer.
+    use_spec_decoding: bool = False
+    # Max draft length for spec decoding
+    _max_draft_len: int = 0
+    # Prefill wrapper for spec decoding (for generation sequences with seq_len > 1)
+    _spec_dec_prefill_wrapper: Optional[
+        flashinfer.BatchPrefillWithPagedKVCacheWrapper] = field(init=False,
+                                                                default=None)
+    # Tensors for spec decoding prefill planning
+    _spec_dec_qo_indptr: Optional[torch.Tensor] = field(init=False,
+                                                        default=None)
+    _spec_dec_paged_kv_indptr: Optional[torch.Tensor] = field(init=False,
+                                                              default=None)
 
     def needs_plan(self, plan_params: PlanParams) -> bool:
         if plan_params not in self._plan_params_to_wrappers:
@@ -202,6 +226,54 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         Number of tokens per cache page
         """
         return self.kv_cache_manager.tokens_per_block
+
+    def update_spec_dec_param(
+        self,
+        batch_size: int,
+        is_spec_decoding_enabled: bool,
+        is_spec_dec_tree: bool,
+        is_spec_dec_dynamic_tree: bool,
+        max_draft_len: int,
+        max_total_draft_tokens: int,
+        model_is_wrapped: bool = False,
+        spec_metadata: Optional['SpecMetadata'] = None,
+        spec_tree_manager: Optional['SpecTreeManager'] = None,
+        spec_decoding_tensor: Optional['SpecDecodingTensor'] = None,
+    ) -> None:
+        """
+        Update spec decoding parameters for flashinfer attention.
+
+        For eagle3 one-model, we use prefill kernels for verification since
+        generation sequences have seq_len = max_draft_len + 1 (> 1), and
+        flashinfer decode kernels only support seq_len = 1.
+        """
+        self.is_spec_decoding_enabled = is_spec_decoding_enabled
+        # use_spec_decoding is default to is_spec_decoding_enabled, can be changed per step/layer
+        self.use_spec_decoding = is_spec_decoding_enabled
+        self._max_draft_len = max_draft_len
+
+        # Allocate buffers for spec decoding prefill planning if needed
+        if is_spec_decoding_enabled:
+            if self._spec_dec_qo_indptr is None:
+                self._spec_dec_qo_indptr = torch.zeros(self.max_num_requests +
+                                                       1,
+                                                       device='cuda',
+                                                       dtype=torch.int)
+            if self._spec_dec_paged_kv_indptr is None:
+                self._spec_dec_paged_kv_indptr = torch.zeros(
+                    self.max_num_requests + 1, device='cuda', dtype=torch.int)
+
+    def update_for_spec_dec(self) -> None:
+        """
+        Hook called during forward when using spec-dec one-model mode.
+        Updates internal state when seq_lens change during spec decoding iterations.
+        """
+        # Recompute qo_indptr based on updated seq_lens
+        if self._seq_lens_cuda is not None:
+            torch.cumsum(self._seq_lens_cuda,
+                         dim=0,
+                         dtype=torch.int32,
+                         out=self._qo_indptr[1:self._seq_lens_cuda.size(0) + 1])
 
     def prepare(self) -> None:
         extra_attrs = get_model_extra_attrs()
@@ -465,6 +537,88 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         return plan_params
 
+    def plan_spec_decoding(
+        self,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        q_dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        q_scaling: Optional[float] = None,
+        attention_window_size: Optional[int] = None,
+    ) -> None:
+        """
+        Plan for spec decoding verification.
+
+        For eagle3 one-model speculative decoding, generation sequences have
+        seq_len = max_draft_len + 1 (> 1). Since flashinfer decode kernels only
+        support seq_len = 1, we use prefill kernels for all sequences during
+        verification.
+
+        This method prepares a prefill wrapper that can handle all sequences
+        (both contexts and generations with seq_len > 1).
+        """
+        if not self.use_spec_decoding:
+            return
+
+        num_seqs = self.num_contexts + self.num_generations
+        if num_seqs == 0:
+            return
+
+        # Compute qo_indptr for all sequences
+        torch.cumsum(self._seq_lens_cuda[:num_seqs],
+                     dim=0,
+                     dtype=torch.int32,
+                     out=self._spec_dec_qo_indptr[1:num_seqs + 1])
+
+        # Compute paged_kv_indptr for all sequences
+        paged_kv_indptr = torch.cumsum(
+            torch.tensor([0] + self.num_blocks, dtype=torch.int32),
+            dtype=torch.int32,
+            dim=0,
+        )
+        self._spec_dec_paged_kv_indptr[:num_seqs + 1].copy_(paged_kv_indptr,
+                                                            non_blocking=True)
+
+        # Create or reuse prefill wrapper for spec decoding
+        if self._spec_dec_prefill_wrapper is None:
+            self._spec_dec_prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                self.kv_layout,
+                backend='fa2',
+                qo_indptr_buf=self._spec_dec_qo_indptr,
+                paged_kv_indptr_buf=self._spec_dec_paged_kv_indptr,
+                paged_kv_indices_buf=self._paged_kv_indices,
+                paged_kv_last_page_len_buf=self._paged_kv_last_page_len,
+                use_cuda_graph=False)  # Cannot use CUDA graph for spec decoding
+
+        sm_scale = None
+        if q_scaling is not None:
+            sm_scale = 1 / (math.sqrt(head_dim) * q_scaling)
+
+        window_left = attention_window_size if attention_window_size is not None else -1
+
+        # Must sync before plan
+        torch.cuda.current_stream().synchronize()
+
+        # Plan the spec decoding prefill wrapper for all sequences
+        total_blocks = sum(self.num_blocks)
+        self._spec_dec_prefill_wrapper.plan(
+            self._spec_dec_qo_indptr[:num_seqs + 1],
+            self._spec_dec_paged_kv_indptr[:num_seqs + 1],
+            self._paged_kv_indices[:total_blocks],
+            self._paged_kv_last_page_len[:num_seqs],
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            self.page_size,
+            causal=True,  # Always use causal mask for spec decoding
+            sm_scale=sm_scale,
+            window_left=window_left,
+            q_data_type=q_dtype,
+            kv_data_type=kv_dtype,
+        )
+
 
 class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
 
@@ -521,9 +675,11 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                     f"KV cache should have fp8 dtype, but get {kv_cache.dtype}")
                 k = k.to(torch.float8_e4m3fn)
                 v = v.to(torch.float8_e4m3fn)
-            assert k.dtype == v.dtype == kv_cache.dtype, (
-                f"KV cache dtype {kv_cache.dtype} does not match k/v dtype {k.dtype}/{v.dtype}"
-            )
+            if k.dtype != kv_cache.dtype:
+                k = k.to(kv_cache.dtype)
+
+            if v.dtype != kv_cache.dtype:
+                v = v.to(kv_cache.dtype)
 
             flashinfer.page.append_paged_kv_cache(
                 append_key=k,
@@ -540,36 +696,63 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         num_generations = metadata.num_generations
         num_ctx_tokens = metadata.num_ctx_tokens
 
-        def prefill_forward(plan_params: PlanParams, out: torch.Tensor):
-            wrapper = metadata.get_prefill_wrapper(plan_params)
-            wrapper.run(q[:num_ctx_tokens],
-                        kv_cache,
-                        out=out.view(-1, self.num_heads, self.head_dim))
+        # Check if we're in spec decoding mode with generations that have seq_len > 1
+        # In this case, use prefill kernel for all sequences (including generations)
+        use_spec_dec_prefill = (metadata.use_spec_decoding
+                                and num_generations > 0
+                                and metadata._max_draft_len > 0)
 
-        def decode_forward(plan_params: PlanParams, out: torch.Tensor):
-            wrapper = metadata.get_decode_wrapper(plan_params)
-            wrapper.run(q[num_ctx_tokens:],
-                        kv_cache,
-                        out=out.view(-1, self.num_heads, self.head_dim))
-
-        # this will do nothing if the last forward pass had the same parameters
-        plan_params = metadata.plan(self.num_heads,
-                                    self.num_kv_heads,
-                                    self.head_dim,
-                                    q_dtype=q.dtype,
-                                    kv_dtype=kv_cache.dtype,
-                                    q_scaling=self.q_scaling,
-                                    attention_window_size=attention_window_size,
-                                    attention_mask_type=attention_mask_type,
-                                    attention_mask_data=attention_mask_data)
-
-        if num_contexts == 0:
-            decode_forward(plan_params, output)
-        elif num_generations == 0:
-            prefill_forward(plan_params, output)
+        if use_spec_dec_prefill:
+            # For spec decoding verification, use prefill kernel for all sequences
+            # because generation sequences have seq_len = max_draft_len + 1 > 1
+            metadata.plan_spec_decoding(
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                q_dtype=q.dtype,
+                kv_dtype=kv_cache.dtype,
+                q_scaling=self.q_scaling,
+                attention_window_size=attention_window_size,
+            )
+            # Run prefill for all sequences using the spec decoding wrapper
+            metadata._spec_dec_prefill_wrapper.run(q,
+                                                   kv_cache,
+                                                   out=output.view(
+                                                       -1, self.num_heads,
+                                                       self.head_dim))
         else:
-            prefill_forward(plan_params, output[:num_ctx_tokens, :])
-            decode_forward(plan_params, output[num_ctx_tokens:, :])
+            # Standard forward path
+            def prefill_forward(plan_params: PlanParams, out: torch.Tensor):
+                wrapper = metadata.get_prefill_wrapper(plan_params)
+                wrapper.run(q[:num_ctx_tokens],
+                            kv_cache,
+                            out=out.view(-1, self.num_heads, self.head_dim))
+
+            def decode_forward(plan_params: PlanParams, out: torch.Tensor):
+                wrapper = metadata.get_decode_wrapper(plan_params)
+                wrapper.run(q[num_ctx_tokens:],
+                            kv_cache,
+                            out=out.view(-1, self.num_heads, self.head_dim))
+
+            # this will do nothing if the last forward pass had the same parameters
+            plan_params = metadata.plan(
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                q_dtype=q.dtype,
+                kv_dtype=kv_cache.dtype,
+                q_scaling=self.q_scaling,
+                attention_window_size=attention_window_size,
+                attention_mask_type=attention_mask_type,
+                attention_mask_data=attention_mask_data)
+
+            if num_contexts == 0:
+                decode_forward(plan_params, output)
+            elif num_generations == 0:
+                prefill_forward(plan_params, output)
+            else:
+                prefill_forward(plan_params, output[:num_ctx_tokens, :])
+                decode_forward(plan_params, output[num_ctx_tokens:, :])
 
     def forward(self,
                 q: torch.Tensor,
