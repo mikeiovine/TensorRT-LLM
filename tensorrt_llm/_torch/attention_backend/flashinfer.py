@@ -2,7 +2,12 @@ import math
 import os
 import weakref
 from dataclasses import dataclass, field
-from typing import Dict, Literal, Optional
+from typing import TYPE_CHECKING, Dict, Literal, Optional
+
+if TYPE_CHECKING:
+    from ..speculative.interface import SpecMetadata
+    from ..speculative.spec_tree_manager import SpecTreeManager
+    from ..speculative.drafting_loops import SpecDecodingTensor
 
 import flashinfer
 import torch
@@ -72,6 +77,14 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _plan_params_to_wrappers: Dict[PlanParams,
                                    FlashInferWrappers] = field(init=False)
 
+    # Speculative decoding support: flag to use prefill kernel for verification
+    use_spec_decoding: bool = False
+
+    # Prefill wrapper for speculative decoding (covers all requests, not just contexts)
+    _spec_dec_prefill_wrapper: Optional[
+        flashinfer.BatchPrefillWithPagedKVCacheWrapper] = field(init=False,
+                                                                default=None)
+
     def needs_plan(self, plan_params: PlanParams) -> bool:
         if plan_params not in self._plan_params_to_wrappers:
             return True
@@ -93,6 +106,13 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         assert plan_params in self._plan_params_to_wrappers, "Plan params not found, make sure to call plan()"
         result = self._plan_params_to_wrappers[plan_params].decode_wrapper
         return result
+
+    def get_spec_dec_prefill_wrapper(
+        self
+    ) -> flashinfer.BatchPrefillWithPagedKVCacheWrapper:
+        """Get the prefill wrapper used for speculative decoding verification."""
+        assert self._spec_dec_prefill_wrapper is not None, "Spec dec prefill wrapper not created"
+        return self._spec_dec_prefill_wrapper
 
     @property
     def paged_kv_indices(self) -> torch.Tensor:
@@ -149,6 +169,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                                   dtype=torch.int)
         self.paged_kv_indptr_prefill = torch.empty(
             (self.max_num_requests + 1, ), device='cuda', dtype=torch.int)
+        # Buffer for spec dec prefill that covers ALL requests (contexts + generations)
+        self.paged_kv_indptr_spec_dec = torch.empty(
+            (self.max_num_requests + 1, ), device='cuda', dtype=torch.int)
         self._paged_kv_last_page_len = torch.empty((self.max_num_requests, ),
                                                    device='cuda',
                                                    dtype=torch.int)
@@ -181,6 +204,19 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 cache_name="_paged_kv_indices",
                 capture_graph=capture_graph,
             )
+
+            # Create spec dec prefill wrapper that uses the spec_dec indptr buffer
+            # This wrapper covers ALL requests for verification (using prefill kernel)
+            # Must be created after _paged_kv_indices is initialized
+            self._spec_dec_prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                self.kv_layout,
+                backend='fa2',
+                qo_indptr_buf=self._qo_indptr,
+                paged_kv_indptr_buf=self.paged_kv_indptr_spec_dec,
+                paged_kv_indices_buf=self._paged_kv_indices,
+                paged_kv_last_page_len_buf=self._paged_kv_last_page_len,
+                use_cuda_graph=capture_graph)
 
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,
@@ -280,6 +316,15 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         )
         self.paged_kv_indptr_prefill[:paged_kv_indptr_prefill.size(0)].copy_(
             paged_kv_indptr_prefill, non_blocking=True)
+
+        # Spec dec indptr covers ALL requests (for using prefill kernel during verification)
+        paged_kv_indptr_spec_dec = torch.cumsum(
+            torch.tensor([0] + self.num_blocks, dtype=torch.int32),
+            dtype=torch.int32,
+            dim=0,
+        )
+        self.paged_kv_indptr_spec_dec[:paged_kv_indptr_spec_dec.size(0)].copy_(
+            paged_kv_indptr_spec_dec, non_blocking=True)
 
         # This paged_kv_indptr attribute has both prefill and decode information in it.
         # It's for the append_paged_kv_cache kernel.
@@ -465,6 +510,73 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         return plan_params
 
+    def plan_spec_dec(self,
+                      num_heads: int,
+                      num_kv_heads: int,
+                      head_dim: int,
+                      q_dtype: torch.dtype,
+                      kv_dtype: torch.dtype,
+                      q_scaling: Optional[float] = None,
+                      attention_window_size: Optional[int] = None) -> None:
+        """
+        Plan the speculative decoding prefill wrapper for verification.
+        Uses prefill kernel for ALL requests (contexts + generations) since
+        verification processes multiple tokens per sequence (draft tokens).
+        """
+        if self.is_cuda_graph and torch.cuda.is_current_stream_capturing():
+            raise ValueError(
+                "Cannot plan_spec_dec() for flashinfer kernels while stream is capturing. "
+                "Make sure you run a few warmup runs before capturing the graph!"
+            )
+
+        sm_scale = None
+        if q_scaling is not None:
+            sm_scale = 1 / (math.sqrt(head_dim) * q_scaling)
+
+        window_left = attention_window_size if attention_window_size is not None else -1
+
+        num_seqs = self.num_contexts + self.num_generations
+        total_blocks = sum(self.num_blocks)
+
+        # Must sync after append_paged_kv_cache and before plan.
+        torch.cuda.current_stream().synchronize()
+
+        # Plan for ALL requests using prefill kernel (for spec dec verification)
+        self._spec_dec_prefill_wrapper.plan(
+            self.qo_indptr[:num_seqs + 1],
+            self.paged_kv_indptr_spec_dec[:num_seqs + 1],
+            self._paged_kv_indices[:total_blocks],
+            self._paged_kv_last_page_len[:num_seqs],
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            self.page_size,
+            causal=True,  # Spec dec verification uses causal attention
+            sm_scale=sm_scale,
+            window_left=window_left,
+            q_data_type=q_dtype,
+            kv_data_type=kv_dtype,
+        )
+
+    def update_spec_dec_param(
+            self,
+            batch_size: int,
+            is_spec_decoding_enabled: bool,
+            is_spec_dec_tree: bool,
+            is_spec_dec_dynamic_tree: bool,
+            max_draft_len: int,
+            max_total_draft_tokens: int,
+            model_is_wrapped: bool = False,
+            spec_metadata: Optional['SpecMetadata'] = None,
+            spec_tree_manager: Optional['SpecTreeManager'] = None,
+            spec_decoding_tensor: Optional['SpecDecodingTensor'] = None) -> None:
+        """
+        Update spec-dec parameters for FlashInfer attention.
+        For FlashInfer, we use the prefill kernel for verification when
+        is_spec_decoding_enabled is True.
+        """
+        self.use_spec_decoding = is_spec_decoding_enabled
+
 
 class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
 
@@ -551,6 +663,29 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             wrapper.run(q[num_ctx_tokens:],
                         kv_cache,
                         out=out.view(-1, self.num_heads, self.head_dim))
+
+        def spec_dec_prefill_forward(out: torch.Tensor):
+            """Use prefill kernel for ALL tokens during spec dec verification."""
+            wrapper = metadata.get_spec_dec_prefill_wrapper()
+            wrapper.run(q,
+                        kv_cache,
+                        out=out.view(-1, self.num_heads, self.head_dim))
+
+        # For speculative decoding verification, use prefill kernel for ALL requests
+        # since generation requests have multiple tokens (draft tokens to verify)
+        if metadata.use_spec_decoding:
+            # Plan the spec dec prefill wrapper
+            metadata.plan_spec_dec(
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                q_dtype=q.dtype,
+                kv_dtype=kv_cache.dtype,
+                q_scaling=self.q_scaling,
+                attention_window_size=attention_window_size,
+            )
+            spec_dec_prefill_forward(output)
+            return
 
         # this will do nothing if the last forward pass had the same parameters
         plan_params = metadata.plan(self.num_heads,
