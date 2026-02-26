@@ -933,6 +933,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                          vocab_size=model_config.pretrained_config.vocab_size)
         self.draft_model = None
         self.draft_config = None
+        self.spec_worker = None
         self.use_separate_draft_kv_cache = False
         spec_config = getattr(model_config, 'spec_config', None)
         if spec_config and spec_config.spec_dec_mode.use_one_engine():
@@ -970,14 +971,17 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(
                 spec_config)
 
-            self.draft_model = get_draft_model(model_config, self.draft_config,
-                                               self.lm_head, self.model)
+            if not spec_config.spec_dec_mode.is_ngram_one_model():
+                self.draft_model = get_draft_model(model_config,
+                                                   self.draft_config,
+                                                   self.lm_head, self.model)
+                self.epilogue.append(self.draft_model)
+
             self.spec_worker = get_spec_worker(
                 model_config.spec_config,
                 model_config,
                 model_config.mapping,
                 use_separate_draft_kv_cache=self.use_separate_draft_kv_cache)
-            self.epilogue.append(self.draft_model)
             self.epilogue.append(self.spec_worker)
 
             if self.draft_config is not None and model_config.spec_config.eagle3_model_arch == "llama3":
@@ -1013,7 +1017,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         if attn_metadata.padded_num_tokens is not None:
             hidden_states = hidden_states[:attn_metadata.num_tokens]
 
-        if self.draft_model is not None:
+        if self.spec_worker is not None:
             # get logits
             logits = self.logits_processor.forward(
                 hidden_states[spec_metadata.gather_ids],

@@ -1134,6 +1134,13 @@ class NGramDecodingConfig(DecodingBaseConfig):
         default=True,
         description="Whether to use a common pool for all requests, or the pool "
         "is private for each request if False.")
+    ngram_one_model: Optional[bool] = Field(
+        default=True,
+        description=
+        "Whether to use the faster one-model implementation (draft generation "
+        "inside target model forward) or the two-model Drafter implementation.")
+
+    _allow_separate_draft_kv_cache: bool = PrivateAttr(False)
 
     @model_validator(mode="after")
     def validate_ngram_config(self):
@@ -1141,6 +1148,14 @@ class NGramDecodingConfig(DecodingBaseConfig):
             raise ValueError("max_draft_len must be > 0 for NGram")
         self.max_total_draft_tokens = self.max_draft_len  # Current NGram only supports linear tree
         return self
+
+    @functools.cached_property
+    def spec_dec_mode(self):
+        from tensorrt_llm._torch.speculative.interface import \
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        if self.ngram_one_model:
+            return TorchSpeculativeDecodingMode.NGRAM_ONE_MODEL
+        return TorchSpeculativeDecodingMode.NGRAM
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"

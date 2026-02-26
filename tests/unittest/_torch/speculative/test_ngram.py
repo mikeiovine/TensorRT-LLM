@@ -13,14 +13,18 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
 
 
-# TODO: add disable_overlap_scheduler=False
 @pytest.mark.parametrize(
-    "disable_overlap_scheduler,use_cuda_graph,attn_backend",
-    [[True, False, "TRTLLM"], [True, True, "TRTLLM"],
-     [True, False, "FLASHINFER"]])
+    "disable_overlap_scheduler,use_cuda_graph,attn_backend,ngram_one_model", [
+        [True, False, "TRTLLM", False],
+        [True, True, "TRTLLM", False],
+        [True, False, "FLASHINFER", False],
+        [True, False, "TRTLLM", True],
+        [False, False, "TRTLLM", True],
+        [True, True, "TRTLLM", True],
+    ])
 @pytest.mark.high_cuda_memory
 def test_llama_ngram(disable_overlap_scheduler: bool, use_cuda_graph: bool,
-                     attn_backend: str):
+                     attn_backend: str, ngram_one_model: bool):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 20:
         pytest.skip("Not enough memory to load target model")
@@ -48,6 +52,7 @@ def test_llama_ngram(disable_overlap_scheduler: bool, use_cuda_graph: bool,
         is_keep_all=True,
         is_use_oldest=True,
         is_public_pool=True,
+        ngram_one_model=ngram_one_model,
     )
 
     prompts = [

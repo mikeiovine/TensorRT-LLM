@@ -1,15 +1,24 @@
+from dataclasses import dataclass
 from itertools import chain
 from typing import Optional
 
+import torch
+
 from ordered_set import OrderedSet
 
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.llmapi import NGramDecodingConfig
 from tensorrt_llm.logger import logger
 
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
-from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
+from ..pyexecutor.resource_manager import (BaseResourceManager,
+                                           ResourceManager,
+                                           ResourceManagerType)
+from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from .drafter import Drafter
+from .interface import SpecMetadata, SpecWorkerBase
+from .mtp import MTPSampler
 
 
 class NGramPoolManager(BaseResourceManager):
@@ -59,6 +68,7 @@ class NGramPoolManager(BaseResourceManager):
         self.max_num_requests = max_num_requests
         self.pool = {}
         self.start_index = {}
+        self.token_buffers: dict[int, list[int]] = {}
 
     def get_max_resource_count(self) -> int:
         return self.max_num_requests
@@ -67,7 +77,9 @@ class NGramPoolManager(BaseResourceManager):
         return 0
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        pass
+        for req in scheduled_batch.context_requests:
+            if req.is_first_context_chunk:
+                self.token_buffers[req.request_id] = list(req.get_tokens(0))
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
         if self.is_public_pool:
@@ -82,6 +94,21 @@ class NGramPoolManager(BaseResourceManager):
                 if request_id in self.pool:
                     self.pool.pop(request_id)
                     self.start_index.pop(request_id)
+
+    def free_resources(self, request: LlmRequest):
+        request_id = request.request_id
+        self.token_buffers.pop(request_id, None)
+        self.start_index.pop(request_id, None)
+        if not self.is_public_pool:
+            self.pool.pop(request_id, None)
+
+    def update_token_buffer(self, request_id: int,
+                            new_tokens: list[int]) -> None:
+        if request_id in self.token_buffers:
+            self.token_buffers[request_id].extend(new_tokens)
+
+    def get_token_buffer(self, request_id: int) -> list[int]:
+        return self.token_buffers.get(request_id, [])
 
     def get_draft_tokens(
         self,
@@ -209,3 +236,145 @@ class NGramDrafter(Drafter):
         """Override to propagate to NGramPoolManager."""
         super().update_max_total_draft_tokens(new_max_total_draft_tokens)
         self.spec_resource_manager.max_total_draft_tokens = new_max_total_draft_tokens
+
+
+@dataclass
+class NGramOneModelSpecMetadata(SpecMetadata):
+    batch_indices_cuda: Optional[torch.Tensor] = None
+
+    def __post_init__(self):
+        self.batch_indices_cuda = torch.empty([self.max_num_requests],
+                                              dtype=torch.int,
+                                              device='cuda')
+
+    def prepare(self):
+        assert self.request_ids is not None
+        num_seqs = len(self.request_ids)
+        batch_indices = torch.arange(num_seqs,
+                                     dtype=torch.int,
+                                     device='cpu',
+                                     pin_memory=prefer_pinned())
+        self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
+                                                 non_blocking=True)
+
+
+class NGramOneModelSampler(MTPSampler):
+
+    def __init__(self, args: TorchSampler.Args):
+        super().__init__(args, nextn=args.max_draft_len)
+
+
+class NGramOneModelWorker(SpecWorkerBase):
+
+    def __init__(self, spec_config: NGramDecodingConfig):
+        super().__init__(use_separate_draft_kv_cache=False)
+        self.spec_config = spec_config
+        self._max_draft_len = spec_config.max_draft_len
+
+    @property
+    def max_draft_len(self) -> int:
+        return self._max_draft_len
+
+    def forward(
+        self,
+        input_ids,
+        position_ids,
+        hidden_states,
+        logits,
+        attn_metadata,
+        spec_metadata,
+        draft_model,
+        resource_manager=None,
+    ):
+        batch_size = attn_metadata.num_seqs
+        num_contexts = attn_metadata.num_contexts
+        num_gens = batch_size - num_contexts
+
+        raw_logits = logits
+
+        self._execute_guided_decoder_if_present(logits)
+
+        # Build draft_tokens tensor for generation requests from spec_metadata
+        if num_gens > 0 and spec_metadata.draft_tokens is not None and len(
+                spec_metadata.draft_tokens) > 0:
+            draft_tokens = spec_metadata.draft_tokens.reshape(
+                num_gens, self._max_draft_len)
+        else:
+            draft_tokens = torch.zeros((num_gens, self._max_draft_len),
+                                       dtype=torch.int,
+                                       device=logits.device)
+
+        accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
+            logits, draft_tokens, num_contexts, batch_size, spec_metadata)
+
+        ngram_pool_manager = self._get_ngram_pool_manager(resource_manager)
+
+        next_draft_tokens = self._generate_ngram_drafts(
+            accepted_tokens, num_accepted_tokens, spec_metadata,
+            attn_metadata, ngram_pool_manager)
+
+        next_new_tokens = self._prepare_next_new_tokens(
+            accepted_tokens, next_draft_tokens,
+            spec_metadata.batch_indices_cuda, batch_size, num_accepted_tokens)
+
+        return {
+            'logits': raw_logits,
+            'new_tokens': accepted_tokens,
+            'new_tokens_lens': num_accepted_tokens,
+            'next_draft_tokens': next_draft_tokens,
+            'next_new_tokens': next_new_tokens,
+        }
+
+    def _get_ngram_pool_manager(
+            self, resource_manager) -> Optional[NGramPoolManager]:
+        if resource_manager is None:
+            return None
+        return resource_manager.get_resource_manager(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+
+    def _generate_ngram_drafts(
+        self,
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        spec_metadata: NGramOneModelSpecMetadata,
+        attn_metadata,
+        ngram_pool_manager: Optional[NGramPoolManager],
+    ) -> torch.Tensor:
+        batch_size = attn_metadata.num_seqs
+        num_contexts = attn_metadata.num_contexts
+        device = accepted_tokens.device
+
+        if ngram_pool_manager is None:
+            return torch.zeros((batch_size, self._max_draft_len),
+                               dtype=torch.int,
+                               device=device)
+
+        accepted_tokens_cpu = accepted_tokens.cpu()
+        num_accepted_cpu = num_accepted_tokens.cpu()
+
+        next_draft_list = []
+        request_ids = spec_metadata.request_ids
+
+        for i in range(batch_size):
+            request_id = request_ids[i]
+            n_accepted = num_accepted_cpu[i].item()
+
+            new_tokens = accepted_tokens_cpu[i, :n_accepted].tolist()
+            ngram_pool_manager.update_token_buffer(request_id, new_tokens)
+            prefix = ngram_pool_manager.get_token_buffer(request_id)
+
+            draft_tokens = ngram_pool_manager.get_draft_tokens(
+                prefix,
+                request_id,
+                max_sequence_length=len(prefix) + self._max_draft_len + 1,
+            )
+
+            padded = draft_tokens[:self._max_draft_len]
+            if len(padded) < self._max_draft_len:
+                padded = padded + [0] * (self._max_draft_len - len(padded))
+            next_draft_list.append(padded)
+
+        next_draft_tokens = torch.tensor(next_draft_list,
+                                         dtype=torch.int,
+                                         pin_memory=prefer_pinned())
+        return next_draft_tokens.to(device=device, non_blocking=True)

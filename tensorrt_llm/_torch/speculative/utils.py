@@ -13,7 +13,9 @@ from .eagle3 import (Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
 from .model_drafter import ModelDrafter
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
-from .ngram import NGramDrafter, NGramPoolManager
+from .ngram import (NGramDrafter, NGramOneModelSampler,
+                    NGramOneModelSpecMetadata, NGramOneModelWorker,
+                    NGramPoolManager)
 from .save_hidden_state import (SaveHiddenStatesResourceManager,
                                 SaveHiddenStatesSpecMetadata)
 
@@ -79,6 +81,13 @@ def get_spec_metadata(spec_config,
             max_num_tokens=max_num_tokens,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
+        )
+    if spec_config.spec_dec_mode.is_ngram_one_model():
+        return NGramOneModelSpecMetadata(
+            max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.max_total_draft_tokens,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
         )
     if spec_config.spec_dec_mode.is_save_hidden_states():
         return SaveHiddenStatesSpecMetadata(
@@ -149,7 +158,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             max_num_requests,
             max_num_tokens,
         )
-    if spec_dec_mode.is_ngram():
+    if spec_dec_mode.is_ngram() or spec_dec_mode.is_ngram_one_model():
         return NGramPoolManager(spec_config, max_num_requests)
     if spec_dec_mode.is_user_provided():
         return spec_config.resource_manager
@@ -167,6 +176,8 @@ def get_spec_decoder(sampler_args: TorchSampler.Args,
         return TorchSampler(sampler_args)
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelSampler(sampler_args)
+    if spec_config.spec_dec_mode.is_ngram_one_model():
+        return NGramOneModelSampler(sampler_args)
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
@@ -224,6 +235,8 @@ def get_spec_worker(spec_config,
     if spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelWorker(spec_config, mapping,
                                     use_separate_draft_kv_cache)
+    if spec_dec_mode.is_ngram_one_model():
+        return NGramOneModelWorker(spec_config)
     return None
 
 

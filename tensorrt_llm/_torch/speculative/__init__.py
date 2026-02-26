@@ -3,7 +3,9 @@ from .eagle3 import Eagle3SpecMetadata
 from .interface import (SpecMetadata, SpecWorkerBase,
                         should_use_separate_draft_kv_cache)
 from .mtp import MTPEagleWorker, MTPSpecMetadata, MTPWorker
-from .ngram import NGramDrafter, NGramPoolManager
+from .ngram import (NGramDrafter, NGramOneModelSampler,
+                    NGramOneModelSpecMetadata, NGramOneModelWorker,
+                    NGramPoolManager)
 from .save_hidden_state import (SaveHiddenStatesResourceManager,
                                 SaveHiddenStatesSpecMetadata)
 from .spec_tree_manager import SpecTreeManager
@@ -18,6 +20,9 @@ __all__ = [
     "MTPSpecMetadata",
     "MTPWorker",
     "NGramDrafter",
+    "NGramOneModelSampler",
+    "NGramOneModelSpecMetadata",
+    "NGramOneModelWorker",
     "NGramPoolManager",
     "SaveHiddenStatesResourceManager",
     "SaveHiddenStatesSpecMetadata",
