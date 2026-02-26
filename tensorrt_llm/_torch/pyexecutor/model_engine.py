@@ -52,7 +52,8 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            get_num_extra_kv_tokens, get_spec_metadata,
                            update_spec_config_from_model_config)
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
-from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
+from ..speculative.eagle3 import (Eagle3OneModelSpecMetadata,
+                                  Eagle3ResourceManager, Eagle3SpecMetadata)
 from ..speculative.mtp import SampleStateTensorsMTP
 from ..speculative.utils import SpecDecodingTensor
 from ..utils import (get_model_extra_attrs,
@@ -2226,6 +2227,9 @@ class PyTorchModelEngine(ModelEngine):
             if spec_resource_manager is not None and hasattr(
                     spec_resource_manager, 'spec_tree_manager'):
                 spec_tree_manager = spec_resource_manager.spec_tree_manager
+            if spec_tree_manager is None and isinstance(
+                    spec_metadata, Eagle3OneModelSpecMetadata):
+                spec_tree_manager = spec_metadata.spec_tree_manager
 
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
@@ -3470,6 +3474,9 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata = self._set_up_spec_metadata(spec_resource_manager,
                                                        no_cache=kv_cache_manager
                                                        is None)
+            if spec_tree_manager is None and isinstance(
+                    spec_metadata, Eagle3OneModelSpecMetadata):
+                spec_tree_manager = spec_metadata.spec_tree_manager
             # attn_metadata now depends on spec_metadata since it determines the shape/content of spec_dec parameter Tensors
             is_spec_dec_mode = spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(
                 spec_resource_manager, self.is_draft_model, self.attn_backend,

@@ -79,6 +79,7 @@ def get_spec_metadata(spec_config,
             max_num_tokens=max_num_tokens,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
+            eagle_choices=spec_config.eagle_choices,
         )
     if spec_config.spec_dec_mode.is_save_hidden_states():
         return SaveHiddenStatesSpecMetadata(

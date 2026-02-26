@@ -299,6 +299,10 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     # The index of the batche inputs
     batch_indices_cuda: Optional[torch.Tensor] = None
 
+    # Static tree configuration
+    eagle_choices: Optional[List[List[int]]] = None
+    spec_tree_manager: Optional[SpecTreeManager] = None
+
     def __post_init__(self):
         if self.layers_to_capture is None:
             if self.num_layers == 1:
@@ -324,18 +328,26 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
             device='cuda',
         )
 
-        # currently Eagle3 only supports linear tree
-        self.is_spec_dec_tree = False
-
-        # currently Eagle3 only supports static tree
-        self.is_spec_dec_dynamic_tree = False
+        if self.eagle_choices is not None:
+            self.is_spec_dec_tree = True
+            self.is_spec_dec_dynamic_tree = False
+            self.spec_tree_manager = SpecTreeManager(
+                max_num_requests=self.max_num_requests,
+                use_dynamic_tree=False,
+                max_draft_len=self.max_draft_len,
+                max_total_draft_tokens=self.max_total_draft_tokens,
+                eagle_choices=self.eagle_choices,
+                dynamic_tree_max_topK=0,
+            )
+        else:
+            self.is_spec_dec_tree = False
+            self.is_spec_dec_dynamic_tree = False
 
     def is_layer_capture(self, layer_id: int):
         return layer_id in self.layers_to_capture
 
     def prepare(self):
         assert self.request_ids is not None
-        # update batch indeices
         num_seqs = len(self.request_ids)
         batch_indices = torch.arange(num_seqs,
                                      dtype=torch.int,
@@ -343,7 +355,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                                      pin_memory=prefer_pinned())
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
                                                  non_blocking=True)
-        self.num_tokens -= (self.num_generations) * self.max_draft_len
+        self.num_tokens -= (self.num_generations) * self.max_total_draft_tokens
 
     def maybe_capture_hidden_states(
             self,
@@ -363,7 +375,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
 class Eagle3OneModelSampler(MTPSampler):
 
     def __init__(self, args: TorchSampler.Args):
-        super().__init__(args, nextn=args.max_draft_len)
+        super().__init__(args, nextn=args.max_total_draft_tokens)
 
 
 class Eagle3OneModelWorker(SpecWorkerBase):
@@ -375,16 +387,18 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.mapping = mapping
+        self._max_total_draft_tokens = spec_config.max_total_draft_tokens
 
     @property
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
+    @property
+    def is_tree_mode(self) -> bool:
+        return self._max_total_draft_tokens > self.max_draft_len
+
     def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
         attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
-        # Save kv_lens_cuda values separately instead of routing through
-        # prepare_for_spec_dec, which would clone the tensor and break the
-        # kv_lens_cuda_runtime view that TRTLLM attention reads from.
         batch_size = attn_metadata.num_seqs
         if hasattr(attn_metadata, 'kv_lens_cuda'):
             self._saved_kv_lens_cuda = attn_metadata.kv_lens_cuda[:
@@ -401,8 +415,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 self._saved_kv_lens_cuda)
             self._saved_kv_lens_cuda = None
 
-    # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
-    # @torch.compile(options={"max-autotune": True})
     def forward(self,
                 input_ids,
                 position_ids,
@@ -412,6 +424,17 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 spec_metadata,
                 draft_model,
                 resource_manager=None):
+        if self.is_tree_mode:
+            return self._forward_tree(input_ids, position_ids, hidden_states,
+                                      logits, attn_metadata, spec_metadata,
+                                      draft_model, resource_manager)
+        return self._forward_linear(input_ids, position_ids, hidden_states,
+                                    logits, attn_metadata, spec_metadata,
+                                    draft_model, resource_manager)
+
+    def _forward_linear(self, input_ids, position_ids, hidden_states, logits,
+                        attn_metadata, spec_metadata, draft_model,
+                        resource_manager):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
@@ -420,14 +443,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         self._execute_guided_decoder_if_present(logits)
 
-        # Sample and accept tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             logits, attn_metadata, spec_metadata)
 
-        # Save the old attn_metadata and spec_metadata
         self._prepare_attn_metadata_for_spec_dec(attn_metadata)
 
-        # Prepare inputs for the 1st draft model forward
         position_ids = position_ids.squeeze(0)
         inputs = self.prepare_1st_drafter_inputs(
             input_ids=input_ids,
@@ -438,11 +458,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             spec_metadata=spec_metadata,
             draft_model=draft_model)
 
-        # Predict draft tokens
         next_draft_tokens = []
         original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
-        # Get the draft KV cache manager if using separate layouts
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(
             resource_manager)
 
@@ -460,7 +478,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     ],
                                               dim=0)
                 else:
-                    # All of the seq_len are 1, use batch_indices_cuda as gather_ids
                     gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
 
                 if self.guided_decoder is not None:
@@ -469,7 +486,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                                         num_accepted_tokens,
                                                         draft_step=i)
 
-                # Update attn_metadata.all_rank_num_tokens for attention DP
                 if original_all_rank_num_tokens is not None:
                     if i == 0:
                         attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
@@ -479,11 +495,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 hidden_states, hidden_states_to_save = draft_model.model(
                     **inputs)
 
-                # FIXME (jhaotingc): Currently we disable use_spec_decoding mode for Eagle engine nth steps except 1st step.
-                # Eagle engine takes in draft_len tokens from the previous step, run spec-dec mode with those tokens,
-                # then the following step can use regular decoding mode to generate 1 tokens per step.
-                # Currently the spec-dec mask for chained tree is not implemented yet.
-                # When token tree is supported, this can be removed and all steps may use spec-dec mode as well.
                 attn_metadata.use_spec_decoding = False
 
                 logits = draft_model.logits_processor(hidden_states[gather_ids],
@@ -497,20 +508,16 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
                 new_draft_token = self.draft_decoder(logits, draft_model)
                 next_draft_tokens.append(new_draft_token)
-                # update inputs
                 hidden_states = hidden_states_to_save[gather_ids]
                 position_ids = inputs["position_ids"][gather_ids] + 1
-                # update attn_metadata
                 if i == 0:
                     attn_metadata._seq_lens[:batch_size].fill_(1)
                     attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
                     attn_metadata.on_update()
-                    # cannot run generation if their is no kv cache
                     if inputs["attn_metadata"].kv_cache_manager is not None:
                         attn_metadata.host_request_types[:attn_metadata.
                                                          num_contexts].fill_(1)
                         attn_metadata.num_contexts = 0
-                    # update kv_lens_cuda
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
                         attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
                             self.max_draft_len -
@@ -518,7 +525,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         attn_metadata.kv_lens_cuda[:num_contexts] += 1
                 elif hasattr(attn_metadata, 'kv_lens_cuda'):
                     attn_metadata.kv_lens_cuda[:batch_size] += 1
-                # support attention dp
                 inputs = {
                     "input_ids": new_draft_token,
                     "position_ids": position_ids,
@@ -528,13 +534,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 }
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
-        # restore attn_metadata to support cuda graph
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
-        # restore all_rank_num_tokens for attention DP
         if original_all_rank_num_tokens is not None:
             attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
 
-        # prepare next new tokens to support overlap scheduler
         next_new_tokens = self._prepare_next_new_tokens(
             accepted_tokens, next_draft_tokens,
             spec_metadata.batch_indices_cuda, batch_size, num_accepted_tokens)
@@ -549,6 +552,338 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             'next_new_tokens': next_new_tokens,
         }
 
+    def _forward_tree(self, input_ids, position_ids, hidden_states, logits,
+                      attn_metadata, spec_metadata, draft_model,
+                      resource_manager):
+        batch_size = attn_metadata.num_seqs
+        num_contexts = attn_metadata.num_contexts
+
+        raw_logits = logits
+        spec_tree_manager = spec_metadata.spec_tree_manager
+        max_total = self._max_total_draft_tokens
+
+        self._execute_guided_decoder_if_present(logits)
+
+        accepted_tokens, num_accepted_tokens = self._sample_and_accept_tree(
+            logits, attn_metadata, spec_metadata, spec_tree_manager)
+
+        self._prepare_attn_metadata_for_spec_dec(attn_metadata)
+
+        position_ids = position_ids.squeeze(0)
+        inputs = self.prepare_1st_drafter_inputs(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            accepted_tokens=accepted_tokens,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            draft_model=draft_model)
+
+        original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+
+        draft_kv_cache_manager = self.get_draft_kv_cache_manager(
+            resource_manager)
+
+        draft_tokens_buffer = torch.zeros(
+            (batch_size, max_total + 1), dtype=torch.int64, device='cuda')
+        position_ids_buffer = torch.zeros(
+            (batch_size, max_total + 1), dtype=torch.int64, device='cuda')
+
+        with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
+            # --- Layer 0: first draft forward (processes accepted tokens) ---
+            start_ids_gen = (
+                spec_metadata.batch_indices_cuda[:batch_size - num_contexts] *
+                (self._max_total_draft_tokens + 1)).long()
+            gather_ids_gen = (start_ids_gen +
+                              num_accepted_tokens[num_contexts:] - 1 +
+                              attn_metadata.num_ctx_tokens)
+            gather_ids = torch.concat([
+                spec_metadata.gather_ids[:num_contexts], gather_ids_gen
+            ],
+                                      dim=0)
+
+            if original_all_rank_num_tokens is not None:
+                attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
+
+            hidden_states_out, hidden_states_to_save = draft_model.model(
+                **inputs)
+
+            logits_0 = draft_model.logits_processor(
+                hidden_states_out[gather_ids], draft_model.lm_head,
+                attn_metadata, True)
+
+            # Sample top-K tokens for the first tree layer
+            max_top_k = spec_tree_manager.max_top_k
+            first_layer_tokens = self._sample_topk(logits_0, max_top_k,
+                                                   draft_model)
+            self._extract_real_draft_tokens(
+                cur_draft_idx=0,
+                batch_size=batch_size,
+                new_draft_tokens=first_layer_tokens,
+                spec_tree_manager=spec_tree_manager,
+                draft_tokens_buffer=draft_tokens_buffer)
+
+            # --- Prepare for tree generation (layers 1+) ---
+            root_hidden_states = hidden_states_to_save[gather_ids]
+            self._prepare_tree_generation(
+                attn_metadata=attn_metadata,
+                spec_metadata=spec_metadata,
+                spec_tree_manager=spec_tree_manager,
+                position_ids=inputs["position_ids"],
+                num_accepted_tokens=num_accepted_tokens,
+                root_hidden_states=root_hidden_states,
+                draft_tokens_buffer=draft_tokens_buffer,
+                position_ids_buffer=position_ids_buffer,
+                draft_model=draft_model,
+                batch_size=batch_size)
+
+            # --- Layers 1+: tree draft forwards ---
+            return_draft_logits = None
+            for layer_idx in range(1, self.max_draft_len):
+                hidden_states_input = self._gather_tree_hidden_states(
+                    hidden_states_to_save if layer_idx > 1 else None,
+                    root_hidden_states, spec_tree_manager, batch_size,
+                    max_total, layer_idx)
+
+                tree_inputs = {
+                    "input_ids":
+                    draft_tokens_buffer[:batch_size, :].reshape(-1),
+                    "position_ids":
+                    position_ids_buffer[:batch_size, :].reshape(-1),
+                    "hidden_states": hidden_states_input,
+                    "attn_metadata": attn_metadata,
+                    "spec_metadata": spec_metadata,
+                }
+
+                if original_all_rank_num_tokens is not None and spec_metadata.all_rank_num_seqs is not None:
+                    attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
+
+                hidden_states_out, hidden_states_to_save = draft_model.model(
+                    **tree_inputs)
+
+                tree_logits = draft_model.logits_processor(
+                    hidden_states_out, draft_model.lm_head, attn_metadata, True)
+
+                new_draft_tokens = self._sample_topk(tree_logits, max_top_k,
+                                                     draft_model)
+                self._extract_real_draft_tokens(
+                    cur_draft_idx=layer_idx,
+                    batch_size=batch_size,
+                    new_draft_tokens=new_draft_tokens,
+                    spec_tree_manager=spec_tree_manager,
+                    draft_tokens_buffer=draft_tokens_buffer)
+
+                if layer_idx == self.max_draft_len - 1:
+                    return_draft_logits = tree_logits
+
+        self._restore_attn_metadata_from_spec_dec(attn_metadata)
+        if original_all_rank_num_tokens is not None:
+            attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
+
+        # Transpose draft tokens: [batch_size, max_total] -> output format
+        next_draft_tokens = draft_tokens_buffer[:batch_size, :max_total].int()
+
+        next_new_tokens = self._prepare_next_new_tokens(
+            accepted_tokens, next_draft_tokens,
+            spec_metadata.batch_indices_cuda, batch_size, num_accepted_tokens)
+
+        attn_metadata.use_spec_decoding = True
+
+        return {
+            'logits': raw_logits,
+            'new_tokens': accepted_tokens,
+            'new_tokens_lens': num_accepted_tokens,
+            'next_draft_tokens': next_draft_tokens,
+            'next_new_tokens': next_new_tokens,
+        }
+
+    def _sample_topk(self, logits: torch.Tensor, max_top_k: int,
+                     draft_model: nn.Module) -> torch.Tensor:
+        indices = torch.topk(logits, k=max_top_k, dim=-1).indices
+        tokens = indices.reshape(-1)
+        if hasattr(draft_model.model, "d2t"):
+            d2t = draft_model.model.d2t.data
+            tokens = tokens + d2t[tokens]
+        return tokens
+
+    def _extract_real_draft_tokens(self, cur_draft_idx: int, batch_size: int,
+                                   new_draft_tokens: torch.Tensor,
+                                   spec_tree_manager: 'SpecTreeManager',
+                                   draft_tokens_buffer: torch.Tensor):
+        max_total = self._max_total_draft_tokens
+        max_top_k = spec_tree_manager.max_top_k
+
+        if cur_draft_idx == 0:
+            new_draft_tokens = new_draft_tokens.reshape(
+                batch_size, -1, max_top_k)
+        else:
+            new_draft_tokens = new_draft_tokens.reshape(
+                batch_size, -1, max_top_k)
+
+        process_tokens = new_draft_tokens[:, spec_tree_manager.
+                                          tokens_gather_idx_for_drafter_model[
+                                              cur_draft_idx], :]
+        process_tokens = process_tokens.reshape(-1, max_top_k)
+
+        top_k_list = spec_tree_manager.top_k_list_cuda[cur_draft_idx].repeat(
+            batch_size)
+
+        col_indices = torch.arange(
+            max_top_k,
+            device=new_draft_tokens.device).unsqueeze(0).repeat(
+                top_k_list.shape[0], 1)
+        mask = col_indices < top_k_list.unsqueeze(1)
+
+        real_tokens = process_tokens[mask]
+        real_tokens = real_tokens.reshape(batch_size, -1)
+
+        start = spec_tree_manager.draft_tokens_indices_cumsum[cur_draft_idx]
+        end = spec_tree_manager.draft_tokens_indices_cumsum[cur_draft_idx + 1]
+        draft_tokens_buffer[:batch_size, start:end] = real_tokens[:, :]
+
+    def _prepare_tree_generation(self, attn_metadata, spec_metadata,
+                                 spec_tree_manager, position_ids,
+                                 num_accepted_tokens, root_hidden_states,
+                                 draft_tokens_buffer, position_ids_buffer,
+                                 draft_model, batch_size):
+        max_total = self._max_total_draft_tokens
+
+        # Position IDs based on tree structure
+        seq_lens = attn_metadata.seq_lens_cuda[:batch_size]
+        num_accepted = spec_metadata.num_accepted_draft_tokens[:batch_size]
+        last_tokens_idx = torch.cumsum(
+            seq_lens, dim=0, dtype=torch.long) - seq_lens + num_accepted
+        position_start_idx = position_ids[last_tokens_idx] + 1
+        position_ids_buffer[:batch_size, :-1] = position_start_idx.unsqueeze(
+            1) + spec_tree_manager.spec_dec_position_offsets[0, 1:].unsqueeze(
+                0) - 1
+
+        # KV lens
+        attn_metadata.kv_lens_cuda[:batch_size] -= seq_lens - num_accepted - 1
+        attn_metadata.kv_lens_cuda[:batch_size] += (max_total + 1)
+
+        # Seq lens
+        attn_metadata._seq_lens[:batch_size].fill_(max_total + 1)
+        attn_metadata._seq_lens_cuda[:batch_size].fill_(max_total + 1)
+        attn_metadata.on_update()
+
+        # Request types
+        attn_metadata.host_request_types[:attn_metadata.num_contexts].fill_(1)
+        attn_metadata.num_contexts = 0
+
+        # Spec decoding masks
+        attn_metadata.use_spec_decoding = True
+        attn_metadata.spec_decoding_position_offsets[:batch_size, :
+                                                     max_total] = spec_tree_manager.spec_dec_position_offsets[
+                                                         0, 1:].unsqueeze(
+                                                             0) - 1
+        attn_metadata.spec_decoding_position_offsets[:batch_size,
+                                                     max_total] = 0
+        attn_metadata.spec_decoding_packed_mask[:
+                                                batch_size, :, :] = spec_tree_manager.spec_dec_packed_mask_for_drafter_model
+        attn_metadata.spec_decoding_generation_lengths[:
+                                                       batch_size] = max_total + 1
+
+        spec_metadata.num_tokens = batch_size * (max_total + 1)
+
+    def _gather_tree_hidden_states(self, prev_hidden_states,
+                                   root_hidden_states, spec_tree_manager,
+                                   batch_size, max_total, layer_idx):
+        """Gather hidden states for tree nodes based on parent relationships.
+
+        The SpecTreeManager offsets use a layout where position 0 = root.
+        The draft model output has positions 0..max_total corresponding to
+        draft tokens (root is NOT included). We prepend root hidden states
+        to align with the offset layout.
+        """
+        offset = spec_tree_manager.hidden_states_read_indices_offset_for_drafter_model
+        hidden_size = root_hidden_states.shape[-1]
+
+        if layer_idx == 1:
+            hs = root_hidden_states.unsqueeze(1).expand(
+                batch_size, max_total + 1,
+                hidden_size).reshape(-1, hidden_size)
+            return hs
+        else:
+            hs = prev_hidden_states.reshape(batch_size, max_total + 1, -1)
+            # Prepend root to match the offset layout: [root, node1, node2, ...]
+            combined = torch.cat(
+                [root_hidden_states.unsqueeze(1), hs],
+                dim=1)  # [batch_size, max_total + 2, hidden_size]
+            parent_offsets = offset[:max_total + 1].unsqueeze(0).expand(
+                batch_size, -1)
+            result = torch.gather(
+                combined, 1,
+                parent_offsets.unsqueeze(-1).expand(-1, -1,
+                                                   hidden_size).long())
+            return result.reshape(-1, hidden_size)
+
+    def _sample_and_accept_tree(self, logits, attn_metadata, spec_metadata,
+                                spec_tree_manager):
+        batch_size = attn_metadata.num_seqs
+        num_contexts = attn_metadata.num_contexts
+        num_gens = batch_size - num_contexts
+        max_total = self._max_total_draft_tokens
+
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+
+        accepted_tokens = torch.empty((batch_size, self.max_draft_len + 1),
+                                      dtype=torch.int,
+                                      device=logits.device)
+        num_accepted_tokens = torch.ones(batch_size,
+                                         dtype=torch.int,
+                                         device=logits.device)
+
+        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
+                                                      num_contexts, batch_size)
+
+        accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
+
+        if num_gens > 0:
+            draft_tokens = spec_metadata.draft_tokens.reshape(
+                num_gens, max_total)
+            gen_target_tokens = target_tokens[num_contexts:].reshape(
+                num_gens, max_total + 1)
+
+            eagle_paths = spec_tree_manager.get_eagle_paths()
+
+            for gen_idx in range(num_gens):
+                batch_idx = num_contexts + gen_idx
+                best_len = 0
+                best_path_idx = 0
+
+                for path_idx, path in enumerate(eagle_paths):
+                    path_excl_root = (path[1:] - 1)
+                    draft_indices = path_excl_root[path_excl_root >= 0]
+                    target_indices = path[path >= 0]
+
+                    if len(draft_indices) != len(target_indices) - 1:
+                        continue
+
+                    cur_draft = draft_tokens[gen_idx][draft_indices]
+                    cur_target = gen_target_tokens[gen_idx][target_indices]
+
+                    matched = torch.cumprod(
+                        (cur_draft == cur_target[:-1]).int(), dim=-1).sum()
+                    cur_len = matched + 1
+
+                    if cur_len > best_len:
+                        best_len = cur_len
+                        best_path_idx = path_idx
+
+                best_path = eagle_paths[best_path_idx]
+                path_indices = best_path[best_path >= 0][:best_len]
+                for j, idx in enumerate(path_indices):
+                    accepted_tokens[batch_idx, j] = gen_target_tokens[gen_idx,
+                                                                      idx]
+                num_accepted_tokens[batch_idx] = best_len
+
+        num_accepted_tokens = self._apply_force_accepted_tokens(
+            num_accepted_tokens, num_contexts)
+
+        return accepted_tokens, num_accepted_tokens
+
     def sample_and_accept_draft_tokens(
         self,
         logits: torch.Tensor,
@@ -559,11 +894,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
-        # Reshape draft tokens for base implementation
         draft_tokens = spec_metadata.draft_tokens.reshape(
             num_gens, self.max_draft_len)
 
-        # Use base implementation for strict acceptance
         return self._sample_and_accept_draft_tokens_base(
             logits, draft_tokens, num_contexts, batch_size, spec_metadata)
 
@@ -572,25 +905,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         logits: torch.Tensor,
         draft_model: nn.Module,
     ):
-        '''
-        Sampling draft tokens with support for non-greedy sampling.
-
-        Args:
-            logits: torch.Tensor
-                [num_tokens, vocab_size]
-                Logits produced by the draft model.
-            draft_model: nn.Module
-                The draft model.
-
-        Returns:
-            draft_tokens: torch.Tensor
-                [batch_size * max_draft_len]
-                Draft token ids. Flattened.
-        '''
-
-        # Note: using greedy for draft tokens is a bit easier to implement and
-        # faster. It doesn't affect the final output and seems to have a negligible
-        # impact on AR.
         d2t = getattr(draft_model.model, "d2t", None)
         return self._draft_sampler_greedy(logits, d2t)
 
@@ -605,24 +919,33 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         draft_model: nn.Module,
     ):
         num_contexts = attn_metadata.num_contexts
+        num_gens = attn_metadata.num_seqs - num_contexts
         num_tokens = input_ids.shape[0]
 
-        # prepare hidden states
         hidden_size_up = spec_metadata.hidden_size * len(
             spec_metadata.layers_to_capture)
         hidden_states = spec_metadata.hidden_states[:num_tokens, :
                                                     hidden_size_up]
         hidden_states = draft_model.apply_eagle3_fc(hidden_states)
 
-        # context
         input_ids_ctx = self._prepare_context_input_ids(
             input_ids, attn_metadata.num_ctx_tokens, spec_metadata.gather_ids,
             accepted_tokens, num_contexts)
 
-        # generation
-        input_ids_gen = accepted_tokens[num_contexts:, :].flatten()
+        if self.is_tree_mode and num_gens > 0:
+            # For tree mode, pad gen input_ids to match target model's
+            # max_total_draft_tokens + 1 tokens per gen request.
+            tokens_per_gen = self._max_total_draft_tokens + 1
+            input_ids_gen = torch.zeros(num_gens * tokens_per_gen,
+                                        dtype=torch.int32,
+                                        device=accepted_tokens.device)
+            for i in range(num_gens):
+                src = accepted_tokens[num_contexts + i, :]
+                input_ids_gen[i * tokens_per_gen:i * tokens_per_gen +
+                              src.shape[0]] = src
+        else:
+            input_ids_gen = accepted_tokens[num_contexts:, :].flatten()
 
-        # get draft inputs
         input_ids = torch.concat([input_ids_ctx, input_ids_gen], dim=0)
 
         return {
