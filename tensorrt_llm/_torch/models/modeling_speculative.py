@@ -6,6 +6,7 @@ from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import DraftMapping
 
 from ...functional import PositionEmbeddingType
 from ..attention_backend import AttentionMetadata
@@ -959,7 +960,26 @@ class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
         )
 
 
-def get_draft_model(model_config, draft_config, lm_head, model):
+def _build_draft_model_config(model_config):
+    """Build a ModelConfig with a DraftMapping if the spec config specifies a
+    different TP size for the draft model. Returns the original config unchanged
+    when no draft_tp_size override is set."""
+    spec_config = model_config.spec_config
+    draft_tp_size = getattr(spec_config, 'draft_tp_size', None)
+    if draft_tp_size is None or draft_tp_size == model_config.mapping.tp_size:
+        return model_config
+    draft_mapping = DraftMapping(model_config.mapping, draft_tp_size)
+    logger.info(
+        f"Using separate draft TP: target_tp={model_config.mapping.tp_size}, "
+        f"draft_tp={draft_tp_size}")
+    return replace(model_config, mapping=draft_mapping)
+
+
+def get_draft_model(model_config,
+                    draft_config,
+                    lm_head,
+                    model,
+                    draft_model_config=None):
     assert getattr(model_config, 'spec_config', None) is not None
     spec_dec_mode = model_config.spec_config.spec_dec_mode
     if spec_dec_mode.is_eagle3_one_model():
@@ -977,7 +997,8 @@ def get_draft_model(model_config, draft_config, lm_head, model):
             )
 
     elif spec_dec_mode.is_mtp_one_model():
-        return MTPForCausalLM(model_config,
+        mc = draft_model_config if draft_model_config is not None else model_config
+        return MTPForCausalLM(mc,
                               model_config.pretrained_config.num_hidden_layers,
                               lm_head, model)
     elif spec_dec_mode.is_mtp_eagle():
@@ -1050,14 +1071,22 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(
                 spec_config)
 
-            self.draft_model = get_draft_model(model_config, self.draft_config,
-                                               self.lm_head, self.model)
+            draft_model_cfg = (
+                _build_draft_model_config(model_config)
+                if spec_config.spec_dec_mode.is_mtp_one_model() else None)
+
+            self.draft_model = get_draft_model(
+                model_config,
+                self.draft_config,
+                self.lm_head,
+                self.model,
+                draft_model_config=draft_model_cfg)
             if spec_config.spec_dec_mode.is_pard(
             ) and self.draft_model is not None:
                 self.draft_model.logits_processor = self.logits_processor
             self.spec_worker = get_spec_worker(
                 model_config.spec_config,
-                model_config,
+                draft_model_cfg if draft_model_cfg is not None else model_config,
                 model_config.mapping,
                 use_separate_draft_kv_cache=self.use_separate_draft_kv_cache)
             self.epilogue.append(self.draft_model)

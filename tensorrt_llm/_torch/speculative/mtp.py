@@ -365,11 +365,13 @@ class MTPWorker(SpecWorkerBase):
     def __init__(self,
                  spec_config: "MTPDecodingConfig",
                  model_config=None,
-                 use_separate_draft_kv_cache: bool = False):
+                 use_separate_draft_kv_cache: bool = False,
+                 lm_head_mapping: 'Mapping' = None):
         super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.model_config = model_config
         self.is_thop = False
+        self._lm_head_mapping = lm_head_mapping
 
     @property
     def max_draft_len(self) -> int:
@@ -1153,17 +1155,18 @@ class MTPWorker(SpecWorkerBase):
                 [batch_size * max_draft_len]
                 Draft token ids. Flattened.
         '''
+        lm_mapping = self._lm_head_mapping if self._lm_head_mapping is not None else self.model_config.mapping
         if (self.model_config is not None
                 and hasattr(self.model_config, 'mapping')
-                and self.model_config.mapping.tp_size
-                > 1) and not (self.model_config.mapping.enable_attention_dp):
-            combined = self.get_local_max_and_combined(logits)
-            gathered = allgather(combined, self.model_config.mapping, dim=-1)
+                and lm_mapping.tp_size
+                > 1) and not (lm_mapping.enable_attention_dp):
+            combined = self.get_local_max_and_combined(logits, lm_mapping)
+            gathered = allgather(combined, lm_mapping, dim=-1)
             draft_tokens = self.get_draft_tokens_from_gathered(gathered)
         elif (self.model_config is not None
               and hasattr(self.model_config, 'mapping')
-              and self.model_config.mapping.tp_size
-              > 1) and self.model_config.mapping.enable_lm_head_tp_in_adp:
+              and lm_mapping.tp_size
+              > 1) and lm_mapping.enable_lm_head_tp_in_adp:
             # For ADP + LM head TP mode, we need to find the global argmax across all TP ranks
             combined = self.get_local_max_and_combined(logits,
                                                        mapping_lm_head_tp)
@@ -1186,8 +1189,10 @@ class MTPEagleWorker(MTPWorker):
     def __init__(self,
                  spec_config: "MTPDecodingConfig",
                  model_config: Optional[ModelConfig] = None,
-                 use_separate_draft_kv_cache: bool = False):
-        super().__init__(spec_config, model_config, use_separate_draft_kv_cache)
+                 use_separate_draft_kv_cache: bool = False,
+                 lm_head_mapping: 'Mapping' = None):
+        super().__init__(spec_config, model_config,
+                         use_separate_draft_kv_cache, lm_head_mapping)
         self.model_config = model_config
         self.mtp_num_modules = spec_config.num_nextn_predict_layers
         self._is_mamba_hybrid_cache = None

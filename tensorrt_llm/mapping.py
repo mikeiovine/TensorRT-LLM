@@ -686,3 +686,300 @@ class DeviceMeshTopology(DeviceMeshTopologyImpl, Mapping):
         ), "DeviceMeshTopology is only available in Ray orchestrator mode."
 
         super().__init__(*args, **kwargs)
+
+
+class DraftMapping:
+    """Mapping adapter for draft models with different TP in 1-model speculative decoding.
+
+    The draft model runs on the same GPUs as the target model but uses smaller
+    TP sub-groups. The target's TP group is split into independent sub-groups,
+    each running a replica of the draft model.
+
+    For example, target TP=8 with draft_tp_size=2 creates four independent
+    draft TP sub-groups: [0,1], [2,3], [4,5], [6,7].
+
+    ProcessGroups for the sub-groups are created collectively during
+    construction, so all ranks must instantiate this class simultaneously.
+    """
+
+    def __init__(self,
+                 target_mapping: Mapping,
+                 draft_tp_size: int,
+                 draft_moe_tp_size: int = -1,
+                 draft_moe_ep_size: int = -1):
+        if target_mapping.tp_size % draft_tp_size != 0:
+            raise ValueError(
+                f"Target TP size ({target_mapping.tp_size}) must be divisible "
+                f"by draft TP size ({draft_tp_size})")
+        if draft_tp_size < 1:
+            raise ValueError(
+                f"Draft TP size must be >= 1, got {draft_tp_size}")
+
+        self._target = target_mapping
+        self._draft_tp_size = draft_tp_size
+
+        target_tp_group = target_mapping.tp_group
+        target_tp_rank = target_mapping.tp_rank
+
+        num_sub_groups = target_mapping.tp_size // draft_tp_size
+        sub_groups = [
+            target_tp_group[i * draft_tp_size:(i + 1) * draft_tp_size]
+            for i in range(num_sub_groups)
+        ]
+
+        group_idx = target_tp_rank // draft_tp_size
+        self._tp_rank = target_tp_rank % draft_tp_size
+        self._tp_group = sub_groups[group_idx]
+
+        if draft_moe_tp_size == -1 and draft_moe_ep_size == -1:
+            self._moe_tp_size = draft_tp_size
+            self._moe_ep_size = 1
+        elif draft_moe_tp_size == -1:
+            self._moe_ep_size = draft_moe_ep_size
+            self._moe_tp_size = draft_tp_size // draft_moe_ep_size
+        elif draft_moe_ep_size == -1:
+            self._moe_tp_size = draft_moe_tp_size
+            self._moe_ep_size = draft_tp_size // draft_moe_tp_size
+        else:
+            self._moe_tp_size = draft_moe_tp_size
+            self._moe_ep_size = draft_moe_ep_size
+
+        if self._moe_tp_size * self._moe_ep_size != draft_tp_size:
+            raise ValueError(
+                f"draft moe_tp_size * moe_ep_size ({self._moe_tp_size} * "
+                f"{self._moe_ep_size}) must equal draft_tp_size "
+                f"({draft_tp_size})")
+
+        self._moe_tp_rank = self._tp_rank // self._moe_ep_size
+        self._moe_ep_rank = self._tp_rank % self._moe_ep_size
+
+        draft_tp_sub = self._tp_group
+        moe_tp_sub_groups = [
+            draft_tp_sub[j::self._moe_ep_size]
+            for j in range(self._moe_ep_size)
+        ]
+        moe_ep_sub_groups = [
+            draft_tp_sub[j * self._moe_ep_size:(j + 1) * self._moe_ep_size]
+            for j in range(self._moe_tp_size)
+        ]
+        self._moe_tp_group = moe_tp_sub_groups[self._moe_ep_rank]
+        self._moe_ep_group = moe_ep_sub_groups[self._moe_tp_rank]
+
+        self._tp_pg = None
+        self._moe_tp_pg = None
+        self._moe_ep_pg = None
+        self._create_process_groups(sub_groups)
+
+    def _create_process_groups(self, tp_sub_groups):
+        try:
+            import torch.distributed as dist
+            if not dist.is_initialized():
+                return
+
+            for sg in tp_sub_groups:
+                pg = dist.new_group(sg)
+                if self._target.rank in sg:
+                    self._tp_pg = pg
+
+            all_moe_tp_groups = set()
+            all_moe_ep_groups = set()
+            for sg in tp_sub_groups:
+                for j in range(self._moe_ep_size):
+                    all_moe_tp_groups.add(tuple(sg[j::self._moe_ep_size]))
+                for j in range(self._moe_tp_size):
+                    all_moe_ep_groups.add(
+                        tuple(sg[j * self._moe_ep_size:(j + 1) *
+                                 self._moe_ep_size]))
+
+            for grp in sorted(all_moe_tp_groups):
+                pg = dist.new_group(list(grp))
+                if self._target.rank in grp:
+                    self._moe_tp_pg = pg
+
+            for grp in sorted(all_moe_ep_groups):
+                pg = dist.new_group(list(grp))
+                if self._target.rank in grp:
+                    self._moe_ep_pg = pg
+        except ImportError:
+            pass
+
+    @property
+    def tp_size(self):
+        return self._draft_tp_size
+
+    @property
+    def tp_rank(self):
+        return self._tp_rank
+
+    @property
+    def tp_group(self):
+        return self._tp_group
+
+    @property
+    def tp_group_pg(self):
+        return self._tp_pg
+
+    @property
+    def moe_tp_size(self):
+        return self._moe_tp_size
+
+    @property
+    def moe_ep_size(self):
+        return self._moe_ep_size
+
+    @property
+    def moe_tp_rank(self):
+        return self._moe_tp_rank
+
+    @property
+    def moe_ep_rank(self):
+        return self._moe_ep_rank
+
+    @property
+    def moe_tp_group(self):
+        return self._moe_tp_group
+
+    @property
+    def moe_ep_group(self):
+        return self._moe_ep_group
+
+    @property
+    def moe_tp_group_pg(self):
+        return self._moe_tp_pg
+
+    @property
+    def moe_ep_group_pg(self):
+        return self._moe_ep_pg
+
+    @property
+    def moe_cluster_size(self):
+        return 1
+
+    @property
+    def moe_cluster_rank(self):
+        return 0
+
+    @property
+    def pp_size(self):
+        return self._target.pp_size
+
+    @property
+    def pp_rank(self):
+        return self._target.pp_rank
+
+    @property
+    def cp_size(self):
+        return self._target.cp_size
+
+    @property
+    def cp_rank(self):
+        return self._target.cp_rank
+
+    @property
+    def rank(self):
+        return self._target.rank
+
+    @property
+    def world_size(self):
+        return self._target.world_size
+
+    @property
+    def gpus_per_node(self):
+        return self._target.gpus_per_node
+
+    @property
+    def local_rank(self):
+        return self._target.local_rank
+
+    @property
+    def node_rank(self):
+        return self._target.node_rank
+
+    @property
+    def enable_attention_dp(self):
+        return self._target.enable_attention_dp
+
+    @property
+    def enable_lm_head_tp_in_adp(self):
+        return self._target.enable_lm_head_tp_in_adp
+
+    @property
+    def dp_size(self):
+        return self._draft_tp_size if self.enable_attention_dp else 1
+
+    @property
+    def moe_tp_cluster_ep_size(self):
+        return self._moe_tp_size * self._moe_ep_size
+
+    def has_tp(self):
+        return self._draft_tp_size > 1
+
+    def has_pp(self):
+        return self._target.has_pp()
+
+    def has_cp(self):
+        return self._target.has_cp()
+
+    def has_moe_tp(self):
+        return self._moe_tp_size > 1
+
+    def has_moe_ep(self):
+        return self._moe_ep_size > 1
+
+    def has_moe_cluster(self):
+        return False
+
+    def get_local_rank(self, rank: int):
+        return self._target.get_local_rank(rank)
+
+    def get_node_rank(self, rank: int):
+        return self._target.get_node_rank(rank)
+
+    def ep_experts(self, num_experts: int):
+        experts_per_rank = num_experts // self._moe_ep_size
+        start = self._moe_ep_rank * experts_per_rank
+        return list(range(start, start + experts_per_rank))
+
+    @property
+    def cp_config(self):
+        return self._target.cp_config
+
+    @property
+    def attn_tp_size(self):
+        return self._draft_tp_size
+
+    @property
+    def attn_cp_size(self):
+        return 1
+
+    def has_cp_ulysses(self):
+        return self._target.has_cp_ulysses()
+
+    def has_cp_helix(self):
+        return self._target.has_cp_helix()
+
+    def is_multi_node(self):
+        return self._target.is_multi_node()
+
+    def pp_layers(self, num_layers: int):
+        return self._target.pp_layers(num_layers)
+
+    def is_last_pp_rank(self):
+        return self._target.is_last_pp_rank()
+
+    def is_first_pp_rank(self):
+        return self._target.is_first_pp_rank()
+
+    def __eq__(self, other):
+        if not isinstance(other, DraftMapping):
+            return NotImplemented
+        return (self._draft_tp_size == other._draft_tp_size
+                and self._moe_tp_size == other._moe_tp_size
+                and self._moe_ep_size == other._moe_ep_size
+                and self._target.rank == other._target.rank
+                and tuple(self._tp_group) == tuple(other._tp_group))
+
+    def __hash__(self):
+        return hash(
+            (self._draft_tp_size, self._moe_tp_size, self._moe_ep_size,
+             self._target.rank, tuple(self._tp_group)))

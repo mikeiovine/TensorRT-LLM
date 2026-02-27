@@ -1200,6 +1200,13 @@ class MTPDecodingConfig(DecodingBaseConfig):
         description=
         "When using EAGLE-style MTP, use faster one-model implementation (drafter as submodule) vs two-model."
     )
+    draft_tp_size: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        "Tensor parallelism size for the draft (MTP) model. When set, the target model's TP group "
+        "is split into independent sub-groups of this size, each running a replica of the draft model. "
+        "Must divide the target model's tp_size evenly. None means the draft uses the same TP as the target."
+    )
 
     # TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`
     # Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.
