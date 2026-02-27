@@ -960,18 +960,26 @@ class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
         )
 
 
+def _get_draft_mapping(model_config):
+    """Return a DraftMapping if the spec config specifies a different TP size
+    for the draft model. Returns None when no override is needed."""
+    spec_config = model_config.spec_config
+    draft_tp_size = getattr(spec_config, 'draft_tp_size', None)
+    if draft_tp_size is None or draft_tp_size == model_config.mapping.tp_size:
+        return None
+    logger.info(
+        f"Using separate draft TP: target_tp={model_config.mapping.tp_size}, "
+        f"draft_tp={draft_tp_size}")
+    return DraftMapping(model_config.mapping, draft_tp_size)
+
+
 def _build_draft_model_config(model_config):
     """Build a ModelConfig with a DraftMapping if the spec config specifies a
     different TP size for the draft model. Returns the original config unchanged
     when no draft_tp_size override is set."""
-    spec_config = model_config.spec_config
-    draft_tp_size = getattr(spec_config, 'draft_tp_size', None)
-    if draft_tp_size is None or draft_tp_size == model_config.mapping.tp_size:
+    draft_mapping = _get_draft_mapping(model_config)
+    if draft_mapping is None:
         return model_config
-    draft_mapping = DraftMapping(model_config.mapping, draft_tp_size)
-    logger.info(
-        f"Using separate draft TP: target_tp={model_config.mapping.tp_size}, "
-        f"draft_tp={draft_tp_size}")
     return replace(model_config, mapping=draft_mapping)
 
 
@@ -1025,12 +1033,14 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         spec_config = getattr(model_config, 'spec_config', None)
         if spec_config and spec_config.spec_dec_mode.use_one_engine():
             if spec_config.spec_dec_mode.is_eagle3_one_model():
+                draft_mapping = _get_draft_mapping(
+                    model_config) or model_config.mapping
                 if spec_config.eagle3_model_arch == "mistral_large3":
                     from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
                         MistralConfigLoader
                     self.draft_config = MistralConfigLoader().load(
                         spec_config.speculative_model,
-                        mapping=model_config.mapping,
+                        mapping=draft_mapping,
                         moe_backend=model_config.moe_backend,
                         moe_max_num_tokens=model_config.moe_max_num_tokens,
                         max_num_tokens=model_config.max_num_tokens,
@@ -1044,7 +1054,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         trust_remote_code=True,
                         attn_backend=model_config.attn_backend,
                         moe_backend=model_config.moe_backend,
-                        mapping=model_config.mapping,
+                        mapping=draft_mapping,
                         spec_config=model_config.spec_config,
                         max_num_tokens=model_config.max_num_tokens,
                         moe_max_num_tokens=model_config.moe_max_num_tokens)

@@ -893,6 +893,13 @@ class EagleDecodingConfig(DecodingBaseConfig):
     eagle3_model_arch: Literal["llama3", "mistral_large3"] = Field(
         default="llama3",
         description="The model architecture of the eagle3 model.")
+    draft_tp_size: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        "Tensor parallelism size for the draft (Eagle3) model. When set, the target model's TP group "
+        "is split into independent sub-groups of this size, each running a replica of the draft model. "
+        "Must divide the target model's tp_size evenly. None means the draft uses the same TP as the target."
+    )
 
     @field_validator('eagle_choices', mode='before')
     @classmethod
