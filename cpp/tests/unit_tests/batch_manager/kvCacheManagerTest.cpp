@@ -3518,7 +3518,7 @@ TEST_P(KVCacheManagerTest, KVCacheManagerRewindTokensTest)
     auto constexpr tokensPerBlock = 64;
     auto constexpr maxBlocksPerSeq = 10;
     auto constexpr maxNumSequences = 8;
-    auto constexpr maxBeamWidth = 1;
+    auto constexpr maxBeamWidth = 2;
     auto constexpr sinkTokenLength = 0;
     auto const stream = std::make_shared<tr::CudaStream>();
 

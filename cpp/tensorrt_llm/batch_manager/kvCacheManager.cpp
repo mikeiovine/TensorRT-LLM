@@ -2399,18 +2399,25 @@ void BlockManager::releaseLastBlock(GenerationRequest& sequence, SizeType32 wind
 void WindowBlockManager::releaseLastBlock(GenerationRequest& sequence)
 {
     auto const requestId = sequence.getRequestId();
+    auto const beamWidth = sequence.getBeamWidth();
     auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
-    auto it = allocatedBlocks.rbegin();
-    auto& block = *it;
-    // Decrease ref count
-    block->decRefCount();
-    // If ref count is zero, move block to free blocks
-    if (!block->hasRefs())
+    TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(allocatedBlocks.size()) >= beamWidth,
+        "%s::releaseLastBlock - allocated blocks (%zu) smaller than beam width (%d)", mLogPrefix.c_str(),
+        allocatedBlocks.size(), beamWidth);
+
+    for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
     {
-        mEvictionPolicy->releaseBlock(block, true);
+        auto const& block = allocatedBlocks.back();
+        // Decrease ref count
+        block->decRefCount();
+        // If ref count is zero, move block to free blocks
+        if (!block->hasRefs())
+        {
+            mEvictionPolicy->releaseBlock(block, true);
+        }
+        // Remove block from allocated blocks
+        allocatedBlocks.pop_back();
     }
-    // Remove block from allocated blocks
-    allocatedBlocks.pop_back();
     // Remove stored block ids in sequence
     sequence.removeLastBlock(mWindowSize);
 }
@@ -3806,7 +3813,6 @@ void KVCacheManager::removeToken(RequestIdType requestId)
     {
         return;
     }
-    TLLM_CHECK_WITH_INFO(sequence.getBeamWidth() == 1, "[kv cache manager] removeToken does not support beamWidth > 1");
     sequence.removeTokens(1);
     for (auto const [windowSize, metadata] : mBlockManager.getWindowSizesMetadata())
     {
