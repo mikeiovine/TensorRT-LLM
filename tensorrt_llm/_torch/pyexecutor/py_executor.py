@@ -1973,9 +1973,21 @@ class PyExecutor:
                         LlmRequestState.GENERATION_IN_PROGRESS,
                         LlmRequestState.DISAGG_GENERATION_INIT):
                     continue
-                request.draft_tokens = [
-                    0
-                ] * self.max_total_draft_tokens if self.max_total_draft_tokens > 0 else []
+                if (self.use_spec_decode and not request.py_disable_speculative_decoding
+                        and request.sampling_config.beam_width > 1
+                        and self.drafter.spec_config.spec_dec_mode.use_one_engine()):
+                    logger.warning(
+                        "Disabling speculative decoding for request %s because "
+                        "one-model speculative decoding does not yet produce "
+                        "beam-distinct accepted tokens (beam_width=%d).",
+                        request.py_request_id,
+                        request.sampling_config.beam_width,
+                    )
+                    request.py_disable_speculative_decoding = True
+                if self.max_total_draft_tokens > 0 and not request.py_disable_speculative_decoding:
+                    request.draft_tokens = [0] * self.max_total_draft_tokens
+                else:
+                    request.draft_tokens = []
 
             # If speculation is off, this function sets py_draft_tokens to []
             # for all active requests. If it's on, we initialize py_draft_tokens

@@ -293,8 +293,18 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         runtime_draft_len = o_next_draft_tokens.shape[1]
 
         if o_new_tokens.dim() == 2:
+            if self.max_beam_width > 1:
+                raise RuntimeError(
+                    "Speculative one-model sampler received beam-collapsed accepted tokens "
+                    "with beam search enabled. This would force identical beam outputs."
+                )
             o_new_tokens = o_new_tokens.unsqueeze(-1).expand(-1, -1, self.max_beam_width)
         if o_next_new_tokens.dim() == 2:
+            if self.max_beam_width > 1:
+                raise RuntimeError(
+                    "Speculative one-model sampler received beam-collapsed next tokens "
+                    "with beam search enabled. This would force identical beam outputs."
+                )
             o_next_new_tokens = o_next_new_tokens.unsqueeze(-1).expand(-1, -1, self.max_beam_width)
         if o_new_tokens_lens.dim() != 1:
             if o_new_tokens_lens.shape[-1] != self.max_beam_width:
