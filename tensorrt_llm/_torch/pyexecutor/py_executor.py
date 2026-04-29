@@ -2626,11 +2626,10 @@ class PyExecutor:
         new_tokens = torch.zeros_like(target_tokens)
         beam_width = target_tokens.shape[-1]
         if beam_width > 1:
-            per_beam_tokens = target_tokens.permute(2, 0, 1)
-            if not torch.equal(per_beam_tokens, per_beam_tokens[:1].expand_as(per_beam_tokens)):
-                raise ValueError(
-                    "Speculative overlap path requires consistent acceptance tokens across beams"
-                )
+            raise RuntimeError(
+                "One-model speculative decoding with beam_width > 1 does not support "
+                "the overlap scheduler path. Please disable overlap scheduler for this run."
+            )
 
         target_tokens = target_tokens[..., 0]  # [max_draft_len + 1, batch_size] or [1, batch_size]
 

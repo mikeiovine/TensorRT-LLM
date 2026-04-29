@@ -384,6 +384,16 @@ def create_py_executor(
             llm_args.disable_overlap_scheduler = True
 
     if spec_config is not None and spec_config.spec_dec_mode.use_one_engine():
+        if (not llm_args.disable_overlap_scheduler and max_beam_width > 1):
+            logger.warning(
+                "Disabling overlap scheduler for one-engine speculative decoding "
+                "when beam search is enabled (max_beam_width=%d). "
+                "The overlap speculative path currently uses a single per-request "
+                "accepted-token stream and can force beams to stay identical.",
+                max_beam_width,
+            )
+            llm_args.disable_overlap_scheduler = True
+
         if not spec_config.allow_advanced_sampling:
             logger.warning(
                 f"Falling back to greedy decoding for {spec_config.decoding_type}. If you "
