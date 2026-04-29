@@ -2035,8 +2035,18 @@ class PyTorchModelEngine(ModelEngine):
         # CRITICAL: Only extract the needed tokens based on num_tokens_per_extend_request
         # new_tokens_device shape: [batch, 1 + max_draft_len]
         # We need: [previous_batch, num_tokens_per_extend_request]
-        new_tokens = new_tokens_device.transpose(
-            0, 1)[previous_slots, :num_tokens_per_extend_request].flatten()
+        selected_new_tokens = new_tokens_device.transpose(
+            0, 1)[previous_slots, :num_tokens_per_extend_request]
+        if selected_new_tokens.dim() == 3:
+            # For beam+spec one-model path, accepted tokens must be consistent across beams.
+            if not torch.equal(
+                    selected_new_tokens,
+                    selected_new_tokens[..., :1].expand_as(selected_new_tokens)):
+                raise ValueError(
+                    "Speculative overlap update requires consistent accepted tokens across beams"
+                )
+            selected_new_tokens = selected_new_tokens[..., 0]
+        new_tokens = selected_new_tokens.flatten()
         self.input_ids_cuda[:total_num_tokens].copy_(new_tokens,
                                                      non_blocking=True)
 
@@ -2804,9 +2814,18 @@ class PyTorchModelEngine(ModelEngine):
                 # previous input ids
                 previous_batch_tokens = previous_batch_len * (
                     1 + self.runtime_draft_len)
-                new_tokens = new_tokens_device.transpose(
-                    0,
-                    1)[previous_slots, :(1 + self.runtime_draft_len)].flatten()
+                selected_new_tokens = new_tokens_device.transpose(
+                    0, 1)[previous_slots, :(1 + self.runtime_draft_len)]
+                if selected_new_tokens.dim() == 3:
+                    # For beam+spec one-model path, accepted tokens must be consistent across beams.
+                    if not torch.equal(
+                            selected_new_tokens,
+                            selected_new_tokens[..., :1].expand_as(selected_new_tokens)):
+                        raise ValueError(
+                            "Speculative overlap update requires consistent accepted tokens across beams"
+                        )
+                    selected_new_tokens = selected_new_tokens[..., 0]
+                new_tokens = selected_new_tokens.flatten()
                 self.input_ids_cuda[num_tokens:num_tokens +
                                     previous_batch_tokens].copy_(
                                         new_tokens, non_blocking=True)
