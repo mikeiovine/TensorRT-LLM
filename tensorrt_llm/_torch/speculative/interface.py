@@ -454,6 +454,7 @@ class SpecMetadata:
         DISABLE_TOPK_VAL = torch.iinfo(torch.int32).max
         DISABLE_TOPP_VAL = 1.0
 
+        use_beam_search = any(request.sampling_config.beam_width > 1 for request in requests)
         for request in requests:
             sampling_config = request.sampling_config
             temp = sampling_config.temperature
@@ -472,7 +473,7 @@ class SpecMetadata:
                 temperature=temp_val,
                 top_k=tk_val,
                 top_p=tp_val,
-                use_beam_search=False)
+                use_beam_search=use_beam_search)
 
             temp_val = DISABLE_TEMP_VAL if is_greedy or temp_val is None or temp_val == 0 else temp_val
             tk_val = DISABLE_TOPK_VAL if is_greedy or tk_val is None or tk_val <= 0 else tk_val

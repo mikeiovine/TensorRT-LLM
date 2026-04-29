@@ -26,7 +26,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
+from ..pyexecutor.llm_request import FinishReason, LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.sampler import (
     DEFAULT_BEAM_IDX,
@@ -103,7 +103,6 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         max_new_tokens = self._get_max_new_tokens(args, draft_len)
         draft_tokens_size = self._get_draft_tokens_storage_size(args, draft_len)
         self.max_beam_width = args.max_beam_width
-        assert self.max_beam_width == 1, "beam width must be 1 for speculative decoding"
 
         self.store = self.Store(
             new_tokens=int_tensor((max_new_tokens, seq_slots, self.max_beam_width)),
@@ -146,6 +145,30 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         Override in subclasses. Default: True (needed for KV cache preparation).
         """
         return True
+
+    @staticmethod
+    def _handle_beam_stop_criteria(
+        request: LlmRequest, new_token: int, *, max_seq_len: int, beam_idx: int
+    ) -> bool:
+        if new_token == request.py_end_id:
+            request.set_finished_reason(FinishReason.END_ID, beam_idx)
+            return True
+
+        if TorchSampler._meet_max_token_stop_criteria(request, max_seq_len, beam_idx):
+            request.set_finished_reason(FinishReason.LENGTH, beam_idx)
+            return True
+
+        if TorchSampler._meet_stop_token_criteria(request, new_token, beam_idx):
+            request.set_finished_reason(FinishReason.STOP_WORDS, beam_idx)
+            return True
+
+        return False
+
+    @staticmethod
+    def _is_beam_finished(request: LlmRequest, beam_idx: int) -> bool:
+        if hasattr(request, "get_finished_reason"):
+            return request.get_finished_reason(beam_idx) != FinishReason.NOT_FINISHED
+        return False
 
     def _request_common_handling(
         self,
@@ -193,19 +216,40 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         new_tokens = state.host.new_tokens.tolist()
         new_tokens_lens_list = state.host.new_tokens_lens.tolist()
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
-        beam_idx = DEFAULT_BEAM_IDX
         runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
 
         for req in state.requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
-            num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
-            for i in range(num_new_tokens):
-                new_token = add_token(req, new_tokens, beam_idx=beam_idx, step=i)
-                if TorchSampler._handle_stop_criteria(
-                    req, new_token, max_seq_len=self.max_seq_len, beam_idx=beam_idx
-                ):
-                    break
+            seq_slot = req.py_seq_slot
+            assert seq_slot is not None
+            req_beam_width = req.sampling_config.beam_width
+            if req_beam_width > self.max_beam_width:
+                raise ValueError(
+                    f"request beam width {req_beam_width} exceeds max beam width {self.max_beam_width}"
+                )
+
+            num_new_tokens = new_tokens_lens_list[seq_slot]
+
+            all_beams_finished = req_beam_width > 1
+            for beam_idx in range(req_beam_width):
+                beam_finished = self._is_beam_finished(req, beam_idx)
+                for i in range(num_new_tokens):
+                    new_token = add_token(req, new_tokens, beam_idx=beam_idx, step=i)
+                    if req_beam_width == 1:
+                        beam_finished = TorchSampler._handle_stop_criteria(
+                            req, new_token, max_seq_len=self.max_seq_len, beam_idx=beam_idx
+                        )
+                    elif self._handle_beam_stop_criteria(
+                        req, new_token, max_seq_len=self.max_seq_len, beam_idx=beam_idx
+                    ):
+                        beam_finished = True
+                        break
+                all_beams_finished = all_beams_finished and beam_finished
+
+            if req_beam_width > 1 and all_beams_finished:
+                req.state = LlmRequestState.GENERATION_COMPLETE
+
             req.py_num_accepted_draft_tokens = num_new_tokens - 1
             req.py_rewind_len = runtime_draft_len - req.py_num_accepted_draft_tokens
             self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
@@ -248,6 +292,21 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         o_next_new_tokens = outputs["next_new_tokens"][num_skip : num_skip + num_sampling_requests]
         runtime_draft_len = o_next_draft_tokens.shape[1]
 
+        if o_new_tokens.dim() == 2:
+            o_new_tokens = o_new_tokens.unsqueeze(-1).expand(-1, -1, self.max_beam_width)
+        if o_next_new_tokens.dim() == 2:
+            o_next_new_tokens = o_next_new_tokens.unsqueeze(-1).expand(-1, -1, self.max_beam_width)
+        if o_new_tokens_lens.dim() != 1:
+            if o_new_tokens_lens.shape[-1] != self.max_beam_width:
+                raise ValueError("unexpected new_tokens_lens width for speculative decoding")
+            if not torch.equal(
+                o_new_tokens_lens, o_new_tokens_lens[:, :1].expand_as(o_new_tokens_lens)
+            ):
+                raise ValueError(
+                    "1-model speculative decoding requires equal accepted length across beams"
+                )
+            o_new_tokens_lens = o_new_tokens_lens[:, 0]
+
         # Pad or truncate to match fixed-size store buffers for index_copy_.
         # Use actual store buffer dimensions (which may differ from draft_len
         # when _get_max_new_tokens is overridden, e.g. dynamic tree mode).
@@ -274,8 +333,8 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             o_next_new_tokens = o_next_new_tokens[:, :next_new_tokens_width]
 
         # Use index_copy_ for efficient copying (slots are unique)
-        self.store.new_tokens.squeeze(-1).T.index_copy_(0, slots, o_new_tokens)
-        self.store.next_new_tokens.squeeze(-1).T.index_copy_(0, slots, o_next_new_tokens)
+        self.store.new_tokens.permute(1, 0, 2).index_copy_(0, slots, o_new_tokens)
+        self.store.next_new_tokens.permute(1, 0, 2).index_copy_(0, slots, o_next_new_tokens)
         self.store.new_tokens_lens.index_copy_(0, slots, o_new_tokens_lens)
         self.store.next_draft_tokens.index_copy_(0, slots, o_next_draft_tokens)
 

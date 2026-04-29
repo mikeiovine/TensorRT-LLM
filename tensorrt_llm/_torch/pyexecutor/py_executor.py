@@ -2622,12 +2622,17 @@ class PyExecutor:
         has_draft_tokens = target_inputs is not None and isinstance(
             target_inputs, SampleStateTensorsSpec
         ) and target_inputs.next_draft_tokens is not None
-        target_tokens = target_outputs.new_tokens  # [max_draft_len + 1, batch_size, beam_width] or [1, batch_size, beam_width]
+        target_tokens = target_outputs.new_tokens  # [max_draft_len + 1, batch_size, beam_width]
         new_tokens = torch.zeros_like(target_tokens)
+        beam_width = target_tokens.shape[-1]
+        if beam_width > 1:
+            per_beam_tokens = target_tokens.permute(2, 0, 1)
+            if not torch.equal(per_beam_tokens, per_beam_tokens[:1].expand_as(per_beam_tokens)):
+                raise ValueError(
+                    "Speculative overlap path requires consistent acceptance tokens across beams"
+                )
 
-        # Squeeze the beam dimension (beam_width=1 for greedy or single beam)
-        target_tokens = target_tokens.squeeze(
-            -1)  # [max_draft_len + 1, batch_size] or [1, batch_size]
+        target_tokens = target_tokens[..., 0]  # [max_draft_len + 1, batch_size] or [1, batch_size]
 
         batch_size = target_tokens.shape[1]
         device = target_tokens.device
@@ -2661,12 +2666,13 @@ class PyExecutor:
             # Vectorized extraction using advanced indexing (no GPU-CPU sync)
             # Use num_accepted_tokens as indices to gather the right tokens
             batch_indices = torch.arange(batch_size, device=device)
-            new_tokens[0, :, 0] = target_tokens[num_accepted_tokens,
-                                                batch_indices]
+            accepted_tokens = target_tokens[num_accepted_tokens, batch_indices]
+            new_tokens[0, :, :] = accepted_tokens.unsqueeze(-1)
         else:
             # No draft tokens to accept, just use the first (and only) sampled token
             batch_indices = torch.arange(batch_size, device=device)
-            new_tokens[0, :, 0] = target_tokens[0, batch_indices]
+            accepted_tokens = target_tokens[0, batch_indices]
+            new_tokens[0, :, :] = accepted_tokens.unsqueeze(-1)
 
         # Create the updated SampleStateTensorsSpec
         # new_tokens_lens and next_draft_tokens are left as None
