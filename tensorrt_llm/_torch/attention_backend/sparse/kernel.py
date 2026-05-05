@@ -2122,7 +2122,10 @@ def _deepseek_v4_local_to_global_kernel(
     swa_valid_block = swa_block_ordinal < max_blocks_swa
     swa_full_mask = swa_valid_mask & swa_valid_block & req_valid_swa
 
-    swa_bt_ptr = block_table_swa_ptr + req * bt_swa_stride0 + swa_block_ordinal * bt_swa_stride1
+    # Keep pointer arithmetic in-bounds for masked-off lanes.
+    swa_block_ordinal_safe = tl.where(swa_full_mask, swa_block_ordinal, 0)
+    swa_bt_ptr = (block_table_swa_ptr + req * bt_swa_stride0 +
+                  swa_block_ordinal_safe * bt_swa_stride1)
     swa_page_index = tl.load(swa_bt_ptr, mask=swa_full_mask, other=0)
 
     # Treat unallocated block-table rows (-1 sentinel) as invalid.
@@ -2153,9 +2156,12 @@ def _deepseek_v4_local_to_global_kernel(
         compressed_valid_block = compressed_block_ordinal < max_blocks_compressed
         compressed_full_mask = compressed_valid_mask & compressed_valid_block & req_valid_compressed
 
+        compressed_block_ordinal_safe = tl.where(compressed_full_mask,
+                                                 compressed_block_ordinal, 0)
         compressed_bt_ptr = (block_table_compressed_ptr +
                              req * bt_compressed_stride0 +
-                             compressed_block_ordinal * bt_compressed_stride1)
+                             compressed_block_ordinal_safe *
+                             bt_compressed_stride1)
         compressed_page_index = tl.load(compressed_bt_ptr,
                                         mask=compressed_full_mask,
                                         other=0)
@@ -2281,6 +2287,11 @@ def deepseek_v4_local_to_global_indices(
                                                  device=req_id.device)
 
     total_output_indices = num_swa_indices + num_compressed_indices
+    if num_tokens == 0:
+        return torch.empty((0, total_output_indices),
+                           dtype=torch.int32,
+                           device=req_id.device)
+
     num_requests_swa, max_blocks_swa = block_table_swa.shape
 
     # Ensure contiguous tensors
