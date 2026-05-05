@@ -2109,6 +2109,7 @@ def _deepseek_v4_local_to_global_kernel(
     # Load request ID for this token
     req = tl.load(req_id_ptr + token_id)
     req_valid_swa = (req >= 0) & (req < num_requests_swa)
+    req_safe_swa = tl.where(req_valid_swa, req, 0)
 
     # Load all SWA local indices for this token
     swa_ids = tl.arange(0, num_swa_indices)
@@ -2124,7 +2125,7 @@ def _deepseek_v4_local_to_global_kernel(
 
     # Keep pointer arithmetic in-bounds for masked-off lanes.
     swa_block_ordinal_safe = tl.where(swa_full_mask, swa_block_ordinal, 0)
-    swa_bt_ptr = (block_table_swa_ptr + req * bt_swa_stride0 +
+    swa_bt_ptr = (block_table_swa_ptr + req_safe_swa * bt_swa_stride0 +
                   swa_block_ordinal_safe * bt_swa_stride1)
     swa_page_index = tl.load(swa_bt_ptr, mask=swa_full_mask, other=0)
 
@@ -2142,6 +2143,7 @@ def _deepseek_v4_local_to_global_kernel(
 
     if has_compressed:
         req_valid_compressed = (req >= 0) & (req < num_requests_compressed)
+        req_safe_compressed = tl.where(req_valid_compressed, req, 0)
         # Load all compressed local indices for this token
         compressed_ids = tl.arange(0, num_compressed_indices)
         compressed_ptr = (compressed_local_indices_ptr +
@@ -2159,7 +2161,7 @@ def _deepseek_v4_local_to_global_kernel(
         compressed_block_ordinal_safe = tl.where(compressed_full_mask,
                                                  compressed_block_ordinal, 0)
         compressed_bt_ptr = (block_table_compressed_ptr +
-                             req * bt_compressed_stride0 +
+                             req_safe_compressed * bt_compressed_stride0 +
                              compressed_block_ordinal_safe *
                              bt_compressed_stride1)
         compressed_page_index = tl.load(compressed_bt_ptr,
