@@ -2073,6 +2073,8 @@ def _deepseek_v4_local_to_global_kernel(
     compressed_buffer_offset_in_tokens,
     tokens_per_block_swa: tl.constexpr,
     tokens_per_block_compressed: tl.constexpr,
+    num_requests_swa,
+    num_requests_compressed,
     max_blocks_swa,
     max_blocks_compressed,
     num_swa_indices: tl.constexpr,
@@ -2106,6 +2108,7 @@ def _deepseek_v4_local_to_global_kernel(
 
     # Load request ID for this token
     req = tl.load(req_id_ptr + token_id)
+    req_valid_swa = (req >= 0) & (req < num_requests_swa)
 
     # Load all SWA local indices for this token
     swa_ids = tl.arange(0, num_swa_indices)
@@ -2117,10 +2120,15 @@ def _deepseek_v4_local_to_global_kernel(
     swa_block_ordinal = swa_local_idx // tokens_per_block_swa
     swa_token_in_block = swa_local_idx % tokens_per_block_swa
     swa_valid_block = swa_block_ordinal < max_blocks_swa
-    swa_full_mask = swa_valid_mask & swa_valid_block
+    swa_full_mask = swa_valid_mask & swa_valid_block & req_valid_swa
 
     swa_bt_ptr = block_table_swa_ptr + req * bt_swa_stride0 + swa_block_ordinal * bt_swa_stride1
     swa_page_index = tl.load(swa_bt_ptr, mask=swa_full_mask, other=0)
+
+    # Treat unallocated block-table rows (-1 sentinel) as invalid.
+    # Without this guard, a valid local index that lands on an unallocated
+    # row may emit a bogus non-negative global index and trigger OOB access.
+    swa_full_mask = swa_full_mask & (swa_page_index >= 0)
 
     swa_global_index = swa_buffer_offset_in_tokens + swa_page_index * tokens_per_block_swa + swa_token_in_block
     swa_global_index = tl.where(swa_full_mask, swa_global_index, -1)
@@ -2130,6 +2138,7 @@ def _deepseek_v4_local_to_global_kernel(
     tl.store(swa_out_ptr, swa_global_index)
 
     if has_compressed:
+        req_valid_compressed = (req >= 0) & (req < num_requests_compressed)
         # Load all compressed local indices for this token
         compressed_ids = tl.arange(0, num_compressed_indices)
         compressed_ptr = (compressed_local_indices_ptr +
@@ -2142,7 +2151,7 @@ def _deepseek_v4_local_to_global_kernel(
         compressed_block_ordinal = compressed_local_idx // tokens_per_block_compressed
         compressed_token_in_block = compressed_local_idx % tokens_per_block_compressed
         compressed_valid_block = compressed_block_ordinal < max_blocks_compressed
-        compressed_full_mask = compressed_valid_mask & compressed_valid_block
+        compressed_full_mask = compressed_valid_mask & compressed_valid_block & req_valid_compressed
 
         compressed_bt_ptr = (block_table_compressed_ptr +
                              req * bt_compressed_stride0 +
@@ -2150,6 +2159,12 @@ def _deepseek_v4_local_to_global_kernel(
         compressed_page_index = tl.load(compressed_bt_ptr,
                                         mask=compressed_full_mask,
                                         other=0)
+
+        # See SWA branch above: drop block-table rows that resolve to
+        # negative sentinels so we never emit a positive-but-bogus global
+        # index downstream.
+        compressed_full_mask = compressed_full_mask & (compressed_page_index
+                                                       >= 0)
 
         compressed_global_index = (
             compressed_buffer_offset_in_tokens +
@@ -2225,6 +2240,8 @@ def deepseek_v4_local_to_global_indices(
     has_compressed = compress_ratio > 1
 
     # Compute SWA buffer offset relative to swa_pool_base_ptr in tokens
+    assert (swa_buffer_ptr -
+            swa_pool_base_ptr) % token_stride == 0, "swa_buffer_ptr must be aligned to token_stride"
     swa_buffer_offset_in_tokens = (swa_buffer_ptr -
                                    swa_pool_base_ptr) // token_stride
 
@@ -2247,12 +2264,14 @@ def deepseek_v4_local_to_global_indices(
         compressed_buffer_offset_in_tokens = (
             compressed_buffer_ptr - compress_pool_base_ptr) // token_stride
         _, max_blocks_compressed = block_table_compressed.shape
+        num_requests_compressed, _ = block_table_compressed.shape
         block_table_compressed_c = block_table_compressed.contiguous()
         compressed_local_indices_c = compressed_local_indices.contiguous()
     else:
         # Dummy values
         tokens_per_block_compressed = tokens_per_block
         compressed_buffer_offset_in_tokens = 0
+        num_requests_compressed = 1
         max_blocks_compressed = 1
         block_table_compressed_c = torch.zeros((1, 1),
                                                dtype=torch.int32,
@@ -2262,7 +2281,7 @@ def deepseek_v4_local_to_global_indices(
                                                  device=req_id.device)
 
     total_output_indices = num_swa_indices + num_compressed_indices
-    _, max_blocks_swa = block_table_swa.shape
+    num_requests_swa, max_blocks_swa = block_table_swa.shape
 
     # Ensure contiguous tensors
     req_id_c = req_id.contiguous()
@@ -2298,6 +2317,8 @@ def deepseek_v4_local_to_global_indices(
         compressed_buffer_offset_in_tokens,
         tokens_per_block,
         tokens_per_block_compressed,
+        num_requests_swa,
+        num_requests_compressed,
         max_blocks_swa,
         max_blocks_compressed,
         num_swa_indices,
