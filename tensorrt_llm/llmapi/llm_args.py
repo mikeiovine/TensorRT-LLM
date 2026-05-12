@@ -908,10 +908,10 @@ class DecodingBaseConfig(StrictBaseModel):
 
     allow_advanced_sampling: bool = Field(
         default=False,
-        status="prototype",
+        status="deprecated",
         description=
-        "If true, allows non-greedy sampling when speculation is used. Only applicable "
-        "to 1-model code paths; non-greedy sampling is always enabled on 2-model paths."
+        "Deprecated. Non-greedy sampling is now always allowed."
+        "Setting this flag has no effect and it will be removed in a future release."
     )
 
     # If set, drafting is allowed to use chain drafter.
@@ -924,6 +924,23 @@ class DecodingBaseConfig(StrictBaseModel):
     _allow_separate_draft_kv_cache: bool = PrivateAttr(True)
     # Internal: true when draft_len_schedule was auto-translated from max_concurrency.
     _translated_from_max_concurrency: bool = PrivateAttr(False)
+
+    @field_validator('allow_advanced_sampling')
+    @classmethod
+    def warn_allow_advanced_sampling_deprecated(cls, v):
+        """Emit a deprecation warning when ``allow_advanced_sampling`` is set to True.
+
+        Non-greedy sampling is now always enabled on 1-model speculative paths,
+        so the flag is a no-op. The flag is kept for backward compatibility and
+        will be removed in a future release.
+        """
+        if v:
+            logger.warning(
+                "`allow_advanced_sampling` is deprecated and will be removed in a "
+                "future release. Non-greedy sampling is now always enabled on "
+                "1-model speculative paths, so setting this flag has no effect. "
+                "Please remove it from your configuration.")
+        return v
 
     @field_validator('draft_len_schedule')
     @classmethod

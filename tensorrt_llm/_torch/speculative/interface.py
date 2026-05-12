@@ -432,7 +432,9 @@ class SpecMetadata:
     # Always set by model_engine.forward() before any downstream code reads it.
     runtime_draft_len: int = 0
 
-    # For non-greedy sampling on 1-model.
+    # Deprecated. Non-greedy sampling is now always enabled on 1-model paths
+    # (gated on ``spec_dec_mode.use_one_engine()``). Kept for backward
+    # compatibility with constructor call sites; the value is not read.
     allow_advanced_sampling: bool = False
     # Sampling parameters for non-greedy sampling (per-request)
     temperatures: Optional[torch.Tensor] = None
@@ -483,8 +485,7 @@ class SpecMetadata:
         from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
         from tensorrt_llm.sampling_params import SamplingParams
 
-        if not self.allow_advanced_sampling or not self.spec_dec_mode.use_one_engine(
-        ):
+        if not self.spec_dec_mode.use_one_engine():
             return
 
         if self.temperatures is None:
@@ -1010,7 +1011,7 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns:
             sampled_tokens: [num_tokens] - Sampled token ids
         """
-        if spec_metadata.allow_advanced_sampling:
+        if spec_metadata.spec_dec_mode.use_one_engine():
             from .one_model_sampler import sampling_batch_spec_dec_one_model
 
             num_gens = batch_size - num_contexts
