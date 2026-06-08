@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -459,10 +459,11 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         appendParam(&launchParams.scratch);
 
         uint32_t multi_block = 1;
-        // if (xqaParams.multi_block_mode)
-        // {
-        //     multi_block = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessor_count);
-        // }
+        if (xqaParams.multi_block_mode)
+        {
+            multi_block = computeMultiBlockCountSpecDec(
+                xqaParams, xqaParams.batch_size, multiprocessor_count, nbTokenBlocksPerGrp);
+        }
         auto const gridDim = (dim3{multi_block, xqaParams.num_kv_heads * nbTokenBlocksPerGrp, xqaParams.batch_size});
         dim3 const blockDim(128, 1, 2);
 
@@ -533,7 +534,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         {
             if (isSpecDec && isGMMAKernel)
             {
-                multi_block = computeMultiBlockCountSpecDecGMMA(
+                multi_block = computeMultiBlockCountSpecDec(
                     xqaParams, xqaParams.batch_size, multiprocessor_count, specDecBlocks);
             }
             else if (!isSpecDec)

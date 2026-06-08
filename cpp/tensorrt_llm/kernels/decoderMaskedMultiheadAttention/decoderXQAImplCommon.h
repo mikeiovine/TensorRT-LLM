@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -397,8 +397,12 @@ inline int computeMultiBlockCountForMLA(XQAParams const& xqaParams, int multipro
     return 1; // disable multi-block for MLA kernel for now.
 }
 
-inline int computeMultiBlockCountSpecDecGMMA(
-    XQAParams const& xqaParams, int batch_size, int multiprocessor_count, int specDecBlocks)
+// Shared multi-block tuning heuristic for spec-dec XQA kernels (both GMMA and HMMA paths).
+// perSeqBlocks is the per-sequence block dimension that is NOT the multi-block dimension:
+//   * GMMA path: specDecBlocks, with gridDim = dim3{specDecBlocks, multi_block, nbKVHeads * batch_size}
+//   * HMMA path: nbTokenBlocksPerGrp, with gridDim = dim3{multi_block, nbKVHeads * nbTokenBlocksPerGrp, batch_size}
+inline int computeMultiBlockCountSpecDec(
+    XQAParams const& xqaParams, int batch_size, int multiprocessor_count, int perSeqBlocks)
 {
     auto const userSpecified = tensorrt_llm::common::getEnvXqaBlocksPerSequence();
     if (userSpecified.has_value())
@@ -416,8 +420,7 @@ inline int computeMultiBlockCountSpecDecGMMA(
         return multi_block_count;
     }
 
-    // gridDim = dim3{specDecBlocks, multi_block, nbKVHeads * xqaParams.batch_size}
-    int single_block_count = specDecBlocks * num_kv_heads * batch_size;
+    int single_block_count = perSeqBlocks * num_kv_heads * batch_size;
     double wave_count = (double) single_block_count / (double) multiprocessor_count;
 
     // Multi block tuning for low CTA: populating CTAs to at most 1 wave of SMs
