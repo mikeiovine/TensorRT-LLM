@@ -24,6 +24,8 @@ from typing import Optional
 
 import torch
 
+from tensorrt_llm.bindings import DataType, ModelConfig
+from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.logger import logger
 
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
@@ -98,6 +100,11 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self.mapping = None
         self.draft_len = draft_len
         self.max_seq_len = args.max_seq_len
+        # Minimal ModelConfig for update_num_tokens_per_iteration (metrics path
+        # is skipped without a speculative decoding module).
+        self._iteration_budget_model_config = ModelConfig(
+            1, 1, 1, 0, 1, 1, DataType.HALF
+        )
 
         seq_slots = args.max_num_sequences
         max_tokens = self._get_max_tokens(args, draft_len)
@@ -175,6 +182,12 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
         request.py_decoding_iter += 1
 
+    @staticmethod
+    def _remaining_token_budget(request: LlmRequest, beam_idx: int) -> int:
+        """Tokens still allowed by max_new_tokens / length budget."""
+        generated = request.get_num_tokens(beam_idx) - request.py_orig_prompt_len
+        return max(0, request.py_max_new_tokens - generated)
+
     def update_requests(
         self,
         state: SampleStateSpec,
@@ -184,7 +197,7 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         CPU-side request updates after GPU->CPU sync.
 
         Waits for async copy to complete, then updates request state with:
-        - Accepted tokens
+        - Accepted tokens (clamped to the remaining max_new_tokens budget)
         - Stop criteria checks
         - Next iteration draft tokens
         """
@@ -200,15 +213,34 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         for req in state.requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
-            num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
+            # Speculative verify can return accepted_drafts+1 (bonus) tokens in
+            # one step. Clamp to the remaining length budget so overlap + OSL=1
+            # cannot commit a second output token past max_new_tokens.
+            num_new_tokens = min(
+                int(new_tokens_lens_list[req.py_seq_slot]),
+                self._remaining_token_budget(req, beam_idx),
+            )
+            tokens_added = 0
             for i in range(num_new_tokens):
                 new_token = add_token(req, new_tokens, beam_idx=beam_idx, step=i)
+                tokens_added += 1
                 if TorchSampler._handle_stop_criteria(
                     req, new_token, max_seq_len=self.max_seq_len, beam_idx=beam_idx
                 ):
                     break
-            req.py_num_accepted_draft_tokens = num_new_tokens - 1
+            if tokens_added == 0 and self._remaining_token_budget(req, beam_idx) == 0:
+                # Already at the length budget (e.g. overlapped sample after the
+                # pending context token exhausted max_new_tokens).
+                req.finish_by(FinishReason.LENGTH, beam_idx)
+            # Rewind / acceptance metadata must reflect tokens actually
+            # committed, not the raw GPU acceptance count before clamping.
+            req.py_num_accepted_draft_tokens = max(0, tokens_added - 1)
             req.py_rewind_len = runtime_draft_len - req.py_num_accepted_draft_tokens
+            # Match TrtSampler: overlap will_complete_next_iteration() uses this.
+            if tokens_added > 0:
+                req.update_num_tokens_per_iteration(
+                    tokens_added, self._iteration_budget_model_config
+                )
             self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
 
     def sample_async(
