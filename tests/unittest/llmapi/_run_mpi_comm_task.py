@@ -14,11 +14,14 @@
 # limitations under the License.
 
 import os
+import time
 from pathlib import Path
 from typing import Literal
 
 import click
 from _flashinfer_workspace_probe import get_flashinfer_environment
+from _rank_failure_probe import (RANK_1_FAILURE_MESSAGE,
+                                 fail_on_rank_1_while_rank_0_runs)
 
 from tensorrt_llm.executor.utils import get_spawn_proxy_process_ipc_hmac_key_env
 from tensorrt_llm.llmapi.mpi_session import (MpiPoolSession,
@@ -30,12 +33,12 @@ from tensorrt_llm.llmapi.utils import print_colored
 @click.option("--task_type",
               type=click.Choice([
                   "submit", "submit_sync", "flashinfer_workspace",
-                  "flashinfer_temporary_cleanup"
+                  "flashinfer_temporary_cleanup", "async_rank_failure"
               ]),
               default="submit")
 def main(
     task_type: Literal["submit", "submit_sync", "flashinfer_workspace",
-                       "flashinfer_temporary_cleanup"]
+                       "flashinfer_temporary_cleanup", "async_rank_failure"]
 ) -> None:
     """Run the requested remote MPI session test task."""
     # TODO(dlfw-26.08): drop once the nested-spawn failure is settled. The DVM
@@ -102,6 +105,21 @@ def main(
                 for _, cubin_dir in nested_worker_envs
             }
             assert nested_cubin_dirs == {None}
+        elif task_type == "async_rank_failure":
+            # Rank 1 fails at once while rank 0 is still running. The failure
+            # must reach the client well before rank 0's task ends: with a
+            # collective after the task, the failed rank would wait there for
+            # rank 0 and the client would learn nothing until then.
+            hold_seconds = 20.0
+            client.submit(fail_on_rank_1_while_rank_0_runs, hold_seconds)
+            deadline = time.monotonic() + hold_seconds / 2
+            while (error := client.check_worker_error()) is None:
+                assert time.monotonic() < deadline, (
+                    "rank failure was not reported while its peer was still "
+                    "running")
+                time.sleep(0.5)
+            assert RANK_1_FAILURE_MESSAGE in str(error), error
+            print(f"rank failure reported to the client: {error}")
 
 
 if __name__ == "__main__":

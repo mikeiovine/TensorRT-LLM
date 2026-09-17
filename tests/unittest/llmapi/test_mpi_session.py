@@ -69,11 +69,11 @@ def run_client(server_addr, values_to_process, hmac_key: bytes):
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("task_type", [
     "submit", "submit_sync", "flashinfer_workspace",
-    "flashinfer_temporary_cleanup"
+    "flashinfer_temporary_cleanup", "async_rank_failure"
 ])
 def test_remote_mpi_session(
     task_type: Literal["submit", "submit_sync", "flashinfer_workspace",
-                       "flashinfer_temporary_cleanup"],
+                       "flashinfer_temporary_cleanup", "async_rank_failure"],
     tmp_path: Path,
 ) -> None:
     """Test RemoteMpiPoolSessionClient and RemoteMpiPoolSessionServer interaction"""

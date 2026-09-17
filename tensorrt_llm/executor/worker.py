@@ -417,7 +417,16 @@ def worker_main(
             error_msg = (e, traceback.format_exc())
             if not worker_init_status_queue.notify_with_retry(error_msg):
                 logger.error("Failed to deliver error message to proxy")
-        return
+        # Fail the MPI task rather than returning. Only the leader can reach
+        # the proxy over the status queue; a non-leader that returned here
+        # looked like a healthy worker to the session, so the proxy kept
+        # waiting for READY while the surviving ranks blocked in the init
+        # collectives (the launcher-managed RemoteMpiCommSessionServer only
+        # forwards task exceptions to its client). Carry the cause as text:
+        # the original exception may not pickle across the MPI future.
+        raise RuntimeError(
+            f"Executor construction failed on rank {mpi_rank()}: "
+            f"{type(e).__name__}: {e}") from e
 
     # Optionally disable GC (default: not disabled)
     if os.getenv("TRTLLM_WORKER_DISABLE_GC", "0") == "1":

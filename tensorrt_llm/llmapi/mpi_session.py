@@ -893,6 +893,13 @@ class RemoteMpiCommSessionServer():
         # wait for all ranks to start the task
         mpi_barrier()
 
+        # No collective after the task. A rank whose task failed must complete
+        # its future while its peers are still running -- they may be blocked
+        # in a collective waiting for exactly that rank -- so the failure
+        # reaches the client through the future callbacks instead of
+        # deadlocking here. serve() waits for every rank's future before it
+        # accepts the next task, which is all the ordering a trailing barrier
+        # provided.
         try:
             return task(*args, **kwargs)
         except Exception as e:
@@ -905,7 +912,6 @@ class RemoteMpiCommSessionServer():
             logger_debug(
                 f"MpiCommSession rank{mpi_rank()} task [{task}] finished\n",
                 "green")
-            mpi_barrier()
 
     def serve(self):
         logger_debug(f"RemoteMpiCommSessionServer listening on {self.addr}\n",

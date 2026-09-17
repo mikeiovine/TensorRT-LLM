@@ -101,6 +101,8 @@ def _check_collective_rpc_guard(
 class GenerationExecutorProxy(GenerationExecutor):
     READY_SIGNAL = b"READY"
     WORKER_PROCESS_IDENTITIES_SIGNAL = b"WORKER_PROCESS_IDENTITIES"
+    # Seconds between progress log lines while waiting for the workers' READY.
+    INIT_WAIT_HEARTBEAT_INTERVAL = 60.0
 
     def __init__(
         self,
@@ -932,8 +934,19 @@ class GenerationExecutorProxy(GenerationExecutor):
     def _wait_for_executor_workers_ready(self) -> tuple:
         """Wait for worker readiness while monitoring published processes."""
         worker_processes_registered = False
+        # Worker logs may live in another process (launcher-managed MPI), so
+        # this wait is otherwise silent from the proxy's side; a heartbeat
+        # tells a reader of the proxy log that it is still waiting.
+        wait_started = time.monotonic()
+        next_heartbeat = wait_started + self.INIT_WAIT_HEARTBEAT_INTERVAL
 
         while True:
+            now = time.monotonic()
+            if now >= next_heartbeat:
+                logger.info(
+                    "Still waiting for the executor workers to report ready "
+                    f"({now - wait_started:.0f}s elapsed)")
+                next_heartbeat = now + self.INIT_WAIT_HEARTBEAT_INTERVAL
             if self.worker_init_status_queue.poll(1):
                 status = self.worker_init_status_queue.get()
                 # Send ACK to the worker

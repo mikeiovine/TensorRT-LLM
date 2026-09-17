@@ -289,14 +289,17 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
         resource_governor_queue_addr=None,
         result_queue_addr=("result", b"key"),
     )
-    worker_module.worker_main(
-        engine=object(),
-        worker_queues=worker_queues,
-        log_level=worker_module.logger.level,
-        worker_cls=_FailingWorker,
-        ready_signal=GenerationExecutorProxy.READY_SIGNAL,
-        worker_process_identities_signal=(GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL),
-    )
+    with pytest.raises(RuntimeError, match="Executor construction failed on rank 0"):
+        worker_module.worker_main(
+            engine=object(),
+            worker_queues=worker_queues,
+            log_level=worker_module.logger.level,
+            worker_cls=_FailingWorker,
+            ready_signal=GenerationExecutorProxy.READY_SIGNAL,
+            worker_process_identities_signal=(
+                GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL
+            ),
+        )
 
     assert events[:2] == [
         ("notify", GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL),
@@ -318,6 +321,107 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
         )
 
     assert events == [("notify", GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL)]
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_worker_construction_failure_fails_the_mpi_task(monkeypatch, rank):
+    """A construction failure must fail the rank's MPI future on every rank.
+
+    Only the leader can reach the proxy over the status queue. A non-leader
+    that returned normally looked healthy to the session, so the proxy waited
+    for READY forever while the surviving ranks blocked in the init
+    collectives (nvbugs 6782271).
+    """
+    notified = []
+
+    class _FakeComm:
+        def barrier(self):
+            pass
+
+        def allgather(self, value):
+            return [value]
+
+    class _FakeInitStatusQueue:
+        def notify_with_retry(self, message):
+            notified.append(message)
+            return True
+
+    class _FailingWorker:
+        def __init__(self, *args, **kwargs):
+            raise ValueError("expected construction failure")
+
+    def make_ipc_queue(*args, name, **kwargs):
+        if name == "worker_init_status_queue":
+            return _FakeInitStatusQueue()
+        return _Mock()
+
+    monkeypatch.setattr(worker_module, "mpi_comm", lambda: _FakeComm())
+    monkeypatch.setattr(worker_module, "mpi_rank", lambda: rank)
+    monkeypatch.setattr(worker_module, "capture_worker_process_identity", lambda r: ("identity", r))
+    monkeypatch.setattr(worker_module, "set_mpi_session_cpp", lambda comm: None)
+    monkeypatch.setattr(worker_module, "IpcQueue", make_ipc_queue)
+    monkeypatch.setattr(worker_module, "FusedIpcQueue", lambda *args, **kwargs: _Mock())
+    worker_queues = _Mock(
+        frontend_result_queue_addrs=None,
+        request_queue_addr=("request", b"key"),
+        worker_init_status_queue_addr=("status", b"key"),
+        resource_governor_queue_addr=None,
+        result_queue_addr=("result", b"key"),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            f"Executor construction failed on rank {rank}: "
+            "ValueError: expected construction failure"
+        ),
+    ) as excinfo:
+        worker_module.worker_main(
+            engine=object(),
+            worker_queues=worker_queues,
+            log_level=worker_module.logger.level,
+            worker_cls=_FailingWorker,
+            ready_signal=GenerationExecutorProxy.READY_SIGNAL,
+        )
+    assert isinstance(excinfo.value.__cause__, ValueError)
+    # The leader still reports the full error to the proxy first; a non-leader
+    # has no channel to the proxy and relies on the failed future alone.
+    if rank == 0:
+        assert len(notified) == 1
+        assert isinstance(notified[0][0], ValueError)
+    else:
+        assert notified == []
+
+
+def test_server_task_wrapper_has_no_collective_after_the_task(monkeypatch):
+    """A failed rank must complete its future while its peers still run.
+
+    The wrapper used to end in a barrier, so a rank that failed during
+    executor construction sat in that barrier while its peers blocked in the
+    init collectives waiting for it: the exception never reached the future,
+    the server forwarded nothing to its client, and the proxy waited for READY
+    until the caller's timeout (nvbugs 6782271).
+    """
+    from tensorrt_llm.llmapi import mpi_session as mpi_session_module
+    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer
+
+    barriers = []
+    monkeypatch.setattr(mpi_session_module, "mpi_barrier", lambda: barriers.append(1))
+    monkeypatch.setattr(mpi_session_module, "mpi_rank", lambda: 1)
+    # Only bound on multi-device builds; the wrapper's debug logging names it.
+    monkeypatch.setattr(mpi_session_module, "mpi_world_size", lambda: 2, raising=False)
+
+    def failing_task():
+        assert barriers == [1], "the task must start after the entry barrier"
+        raise ValueError("rank exploded")
+
+    with pytest.raises(ValueError, match="rank exploded"):
+        RemoteMpiCommSessionServer.task_wrapper(failing_task)
+    assert barriers == [1]
+
+    barriers.clear()
+    assert RemoteMpiCommSessionServer.task_wrapper(lambda x: x * 2, 21) == 42
+    assert barriers == [1]
 
 
 def test_result_step_raises_on_engine_dead():
