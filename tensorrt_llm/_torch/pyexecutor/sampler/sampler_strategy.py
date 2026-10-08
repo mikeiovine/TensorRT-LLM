@@ -973,7 +973,9 @@ class _StrategyImpls:
             beam_width_in: int
             beam_width_out: int
             row_stride: int
-            temperature: torch.Tensor
+            temperature: Optional[torch.Tensor]
+            """None when every request in the group uses temperature 1.0, so
+            ``sample`` skips the full-vocab rescaling pass over the logits."""
             length_penalty: Optional[torch.Tensor]
             diversity_rate: Optional[torch.Tensor]
 
@@ -982,7 +984,7 @@ class _StrategyImpls:
             beam_width_in: int,
             beam_width_out: int,
             row_stride: int,
-            temperature: torch.Tensor,
+            temperature: Optional[torch.Tensor],
             length_penalty: Optional[torch.Tensor],
             diversity_rate: Optional[torch.Tensor],
             *,
@@ -1029,9 +1031,12 @@ class _StrategyImpls:
             # narrower requests are admitted this fails loudly instead of
             # silently strideing one request's logits by another's width.
             (row_stride,) = set(strat.row_stride or beam_width_in for strat in narrowed_strats)
-            temperature = _StrategyImpls.BeamSearchStep._make_tensor(
-                [strat[3] or 1.0 for strat in narrowed_strats], torch.float32, cuda_device
-            )
+            temperatures = [strat[3] or 1.0 for strat in narrowed_strats]
+            temperature: Optional[torch.Tensor] = None
+            if any(t != 1.0 for t in temperatures):
+                temperature = _StrategyImpls.BeamSearchStep._make_tensor(
+                    temperatures, torch.float32, cuda_device
+                )
             length_penalties = [strat[4] or 0.0 for strat in narrowed_strats]
             length_penalty: Optional[torch.Tensor] = None
             if any(lp != 0.0 for lp in length_penalties):
@@ -1083,8 +1088,17 @@ class _StrategyImpls:
             # so it must cover every row the forward path laid out: the static
             # admission width, which exceeds beam_width_in while a variable
             # beam width array is still widening.
-            temperature = self._temperature.repeat_interleave(self._row_stride)
-            logits = self._prepare_logits_with_temperature(logits, group_logit_indices, temperature)
+            if self._temperature is None:
+                # Temperature 1.0 everywhere: dividing a [rows, vocab] fp32
+                # tensor by one is a pure copy, so only the row selection the
+                # temperature pass would have done is kept.
+                if group_logit_indices is not None:
+                    logits = torch.index_select(logits, 0, group_logit_indices)
+            else:
+                temperature = self._temperature.repeat_interleave(self._row_stride)
+                logits = self._prepare_logits_with_temperature(
+                    logits, group_logit_indices, temperature
+                )
             return self._select_and_update(logits, group_metadata)
 
         @abc.abstractmethod
@@ -1106,7 +1120,7 @@ class _StrategyImpls:
             beam_width_in: int,
             beam_width_out: int,
             row_stride: int,
-            temperature: torch.Tensor,
+            temperature: Optional[torch.Tensor],
             length_penalty: Optional[torch.Tensor],
             diversity_rate: Optional[torch.Tensor],
             early_stopping: BeamSearchEarlyStop,

@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# A/B sweep of the TensorRT-LLM SID-GR beam benchmark across the decode-attention
+# variants, one output directory per variant, then a combined comparison table.
+#
+#   examples/llm-api/run_sid_gr_trtllm_sweep.sh                 # quick: ctx 1000, batch 1
+#   FULL=1 examples/llm-api/run_sid_gr_trtllm_sweep.sh          # ctx 1000/5000, batch 1 2 4 8
+#   VARIANTS="cascade flashinfer" examples/llm-api/run_sid_gr_trtllm_sweep.sh
+#   GR_DIR=/path/to/gr_offline examples/llm-api/run_sid_gr_trtllm_sweep.sh   # side-by-side with GR
+#
+# Variants:
+#   mmha        legacy per-beam MMHA decode attention, worker in a separate process
+#   cascade     TRTLLM_ENABLE_CASCADE_MMHA=1 (shared-prefix C++ kernels)
+#   flashinfer  cascade + TLLM_FMHA_LIBS=+beam_shared_prefix (FlashInfer shared-prefix library)
+# Every variant except "mmha" runs the executor in-process (--single-process), which is how
+# the GR engine is timed. Set SINGLE_PROCESS=0 to keep the worker process everywhere.
+#
+# Knobs: MODEL, CONTEXT_LENS, BEAM_WIDTHS, BATCH_SIZES, OUTPUT_LEN, WARMUP_RUNS, REPEAT,
+#        OUT_ROOT, EXTRA_ARGS (appended to every run, e.g. "--no-perf-metrics").
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BENCH="${HERE}/bench_sid_gr_beam.py"
+
+MODEL="${MODEL:-Qwen/Qwen3-1.7B}"
+if [[ "${FULL:-0}" == "1" ]]; then
+  CONTEXT_LENS="${CONTEXT_LENS:-1000 5000}"
+  BATCH_SIZES="${BATCH_SIZES:-1 2 4 8}"
+  REPEAT="${REPEAT:-3}"
+else
+  CONTEXT_LENS="${CONTEXT_LENS:-1000}"
+  BATCH_SIZES="${BATCH_SIZES:-1}"
+  REPEAT="${REPEAT:-3}"
+fi
+BEAM_WIDTHS="${BEAM_WIDTHS:-256}"
+OUTPUT_LEN="${OUTPUT_LEN:-3}"
+WARMUP_RUNS="${WARMUP_RUNS:-2}"
+OUT_ROOT="${OUT_ROOT:-benchmark_artifacts/sid_gr/trtllm_sweep_$(date +%Y%m%d_%H%M%S)}"
+VARIANTS="${VARIANTS:-mmha cascade flashinfer}"
+SINGLE_PROCESS="${SINGLE_PROCESS:-1}"
+GR_DIR="${GR_DIR:-}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
+
+mkdir -p "${OUT_ROOT}"
+echo "== TensorRT-LLM SID-GR sweep =="
+echo "model=${MODEL} ctx=${CONTEXT_LENS} beam=${BEAM_WIDTHS} batch=${BATCH_SIZES} output_len=${OUTPUT_LEN}"
+echo "variants=${VARIANTS} out=${OUT_ROOT}"
+nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null || true
+
+common=(
+  --model "${MODEL}"
+  --context-lens "${CONTEXT_LENS}"
+  --beam-widths "${BEAM_WIDTHS}"
+  --batch-sizes "${BATCH_SIZES}"
+  --output-len "${OUTPUT_LEN}"
+  --warmup-runs "${WARMUP_RUNS}"
+  --repeat "${REPEAT}"
+)
+# Tail positions a beam carries before its last token.
+max_tail=$(( OUTPUT_LEN > 1 ? OUTPUT_LEN - 1 : 1 ))
+
+for variant in ${VARIANTS}; do
+  out_dir="${OUT_ROOT}/${variant}"
+  args=("${common[@]}" --out-dir "${out_dir}" --variant "${variant}")
+  case "${variant}" in
+    mmha)
+      args+=(--no-cascade-mmha)
+      ;;
+    cascade)
+      args+=(--cascade-mmha)
+      [[ "${SINGLE_PROCESS}" == "1" ]] && args+=(--single-process)
+      ;;
+    flashinfer)
+      args+=(--cascade-mmha --fmha-libs "+beam_shared_prefix" --beam-max-tail "${max_tail}")
+      [[ "${SINGLE_PROCESS}" == "1" ]] && args+=(--single-process)
+      ;;
+    *)
+      echo "unknown variant ${variant}" >&2
+      exit 2
+      ;;
+  esac
+  # shellcheck disable=SC2206
+  args+=(${EXTRA_ARGS})
+  echo
+  echo "== variant: ${variant} =="
+  if ! python "${BENCH}" offline "${args[@]}" 2>&1 | tee "${OUT_ROOT}/${variant}.log"; then
+    echo "variant ${variant} FAILED (see ${OUT_ROOT}/${variant}.log); continuing" >&2
+  fi
+done
+
+echo
+echo "== comparison =="
+python - "${OUT_ROOT}" "${GR_DIR}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+gr_dir = Path(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else None
+rows = {}
+variants = []
+for variant_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+    variants.append(variant_dir.name)
+    for path in sorted(variant_dir.glob("trtllm_ctx*_beam*_req*.json")):
+        data = json.loads(path.read_text())
+        key = (data["context_len"], data["beam_width"], data["requests"])
+        rows.setdefault(key, {})[variant_dir.name] = data
+
+def gr_ms(key):
+    if gr_dir is None:
+        return None
+    path = gr_dir / f"gr_ctx{key[0]}_beam{key[1]}_req{key[2]}.json"
+    if not path.exists():
+        return None
+    return float(json.loads(path.read_text())["wall_ms_median"])
+
+header = ["ctx", "beam", "batch"] + [f"{v} ms" for v in variants] + ["GR ms"]
+lines = ["| " + " | ".join(header) + " |", "|" + " ---: |" * len(header)]
+for key in sorted(rows):
+    cells = [str(k) for k in key]
+    for v in variants:
+        d = rows[key].get(v)
+        if d is None or d.get("wall_ms_median") is None:
+            cells.append("")
+        else:
+            pre = d.get("prefill_ms_median")
+            dec = d.get("decode_ms_median")
+            split = f" ({pre:.1f}+{dec:.1f})" if pre is not None and dec is not None else ""
+            cells.append(f"{d['wall_ms_median']:.2f}{split}")
+    gr = gr_ms(key)
+    cells.append(f"{gr:.2f}" if gr is not None else "")
+    lines.append("| " + " | ".join(cells) + " |")
+text = "\n".join(lines)
+(root / "comparison.md").write_text(text + "\n", encoding="utf-8")
+print(text)
+print(f"\nwrote {root / 'comparison.md'}  (cells: wall ms (prefill+decode))")
+PY
