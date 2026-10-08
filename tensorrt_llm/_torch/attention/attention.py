@@ -920,6 +920,21 @@ class Attention(nn.Module):
     ):
         num_tokens = attn_metadata.num_tokens
 
+        # A batch padded for a prefill CUDA graph (padded_num_tokens) carries
+        # more rows than the metadata's token count. The backend sizes its
+        # output from the query it receives, which is sliced to the live
+        # tokens below, while the residual stream downstream keeps the padded
+        # rows; the compiled path avoids the mismatch by preallocating a
+        # padded output and handing the backend a slice, so do the same here
+        # when the caller did not provide one.
+        padded_output: Optional[torch.Tensor] = None
+        if output is None and q.shape[0] > num_tokens:
+            outputs = self.create_output(q, attn_metadata, attention_mask)
+            output = outputs[0]
+            if len(outputs) == 2:
+                output_sf = outputs[1]
+            padded_output = output
+
         q = q[:num_tokens, :]
         if k is not None:
             k = k[:num_tokens, :]
@@ -1006,6 +1021,9 @@ class Attention(nn.Module):
                 relative_attention_bias=relative_attention_bias,
                 relative_attention_max_distance=relative_attention_max_distance,
             ))
+        if padded_output is not None:
+            # The backend filled the live rows of the padded buffer in place.
+            return padded_output, output_sf
         if isinstance(attn_output, tuple):
             assert len(
                 attn_output
