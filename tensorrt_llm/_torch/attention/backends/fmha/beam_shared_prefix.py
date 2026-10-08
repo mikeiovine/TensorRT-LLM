@@ -196,6 +196,11 @@ class _StepIndices:
     """[rows] bool: the row has no cached token before the current one (only
     warmup/dummy rows). Its prefix call runs over a one-token placeholder and
     is masked out of the merge."""
+    captured: bool
+    """Computed while a CUDA graph was being captured. A graph must record the
+    index computation itself: tensors computed by an eager warmup iteration
+    live outside the graph's memory pool and are freed by the next plan, so a
+    replay reading them would read recycled memory."""
 
 
 @dataclass
@@ -432,8 +437,10 @@ def _step_indices(
     """
     plan = state.plan
     assert plan is not None
-    if state.indices is not None and state.indices.step == plan.step:
-        return state.indices
+    capturing = torch.cuda.is_current_stream_capturing()
+    cached = state.indices
+    if cached is not None and cached.step == plan.step and (cached.captured or not capturing):
+        return cached
 
     beam_width = plan.beam_width
     rows = plan.num_requests * beam_width
@@ -484,6 +491,7 @@ def _step_indices(
         tail_slot=tail_slot,
         tail_valid=tail_valid,
         prefix_empty=prefix_empty,
+        captured=capturing,
     )
     return state.indices
 
