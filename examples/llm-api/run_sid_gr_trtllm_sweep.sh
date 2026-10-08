@@ -46,6 +46,8 @@ OUTPUT_LEN="${OUTPUT_LEN:-3}"
 WARMUP_RUNS="${WARMUP_RUNS:-2}"
 OUT_ROOT="${OUT_ROOT:-benchmark_artifacts/sid_gr/trtllm_sweep_$(date +%Y%m%d_%H%M%S)}"
 VARIANTS="${VARIANTS:-mmha cascade flashinfer flashinfer_pcg}"
+# breakable captures attention inside the prefill graph; piecewise (torch.compile) keeps
+# attention eager and is the fallback if breakable misbehaves.
 PREFILL_CUDA_GRAPH="${PREFILL_CUDA_GRAPH:-breakable}"
 SINGLE_PROCESS="${SINGLE_PROCESS:-1}"
 GR_DIR="${GR_DIR:-}"
@@ -126,8 +128,17 @@ import json
 import sys
 from pathlib import Path
 
+import os
+
 root = Path(sys.argv[1])
 gr_dir = Path(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else None
+# recsys-examples examples/sid-gr-inference README, section 6 (H100 80GB HBM3, Qwen3-1.7B,
+# beam 256, 3 output tokens, radix cache off): wall ms by (ctx, beam, batch).
+GR_README_MS = {
+    (1000, 256, 1): 17.611, (1000, 256, 2): 27.768, (1000, 256, 4): 47.736, (1000, 256, 8): 93.230,
+    (5000, 256, 1): 42.255, (5000, 256, 2): 80.904, (5000, 256, 4): 154.224, (5000, 256, 8): 307.917,
+}
+use_readme = gr_dir is None and os.environ.get("GR_README", "1") == "1"
 rows = {}
 variants = []
 for variant_dir in sorted(p for p in root.iterdir() if p.is_dir()):
@@ -139,21 +150,25 @@ for variant_dir in sorted(p for p in root.iterdir() if p.is_dir()):
 
 def gr_ms(key):
     if gr_dir is None:
-        return None
+        return GR_README_MS.get(key) if use_readme else None
     path = gr_dir / f"gr_ctx{key[0]}_beam{key[1]}_req{key[2]}.json"
     if not path.exists():
         return None
     return float(json.loads(path.read_text())["wall_ms_median"])
 
-header = ["ctx", "beam", "batch"] + [f"{v} ms" for v in variants] + ["GR ms"]
+gr_label = "GR ms (README)" if use_readme and gr_dir is None else "GR ms"
+header = ["ctx", "beam", "batch"] + [f"{v} ms" for v in variants] + [gr_label, "best / GR"]
 lines = ["| " + " | ".join(header) + " |", "|" + " ---: |" * len(header)]
 for key in sorted(rows):
     cells = [str(k) for k in key]
+    best = None
     for v in variants:
         d = rows[key].get(v)
         if d is None or d.get("wall_ms_median") is None:
             cells.append("")
         else:
+            wall = float(d["wall_ms_median"])
+            best = wall if best is None else min(best, wall)
             pre = d.get("prefill_ms_median")
             dec = d.get("decode_ms_median")
             queue = d.get("queue_ms_median")
@@ -167,8 +182,12 @@ for key in sorted(rows):
             cells.append(f"{d['wall_ms_median']:.2f}{split}")
     gr = gr_ms(key)
     cells.append(f"{gr:.2f}" if gr is not None else "")
+    cells.append(f"{best / gr:.2f}x" if gr is not None and best is not None else "")
     lines.append("| " + " | ".join(cells) + " |")
 text = "\n".join(lines)
+if use_readme and gr_dir is None:
+    text += ("\n\nGR column: recsys-examples sid-gr-inference README (H100 80GB HBM3), not "
+             "measured on this machine.")
 (root / "comparison.md").write_text(text + "\n", encoding="utf-8")
 print(text)
 print(f"\nwrote {root / 'comparison.md'}  (cells: wall ms (q queue + p prefill + d decode) "
