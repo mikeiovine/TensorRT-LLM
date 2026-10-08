@@ -63,6 +63,10 @@ common=(
   --warmup-runs "${WARMUP_RUNS}"
   --repeat "${REPEAT}"
 )
+# ITER_STATS=0 drops the per-iteration executor stats (they add a little host work).
+if [[ "${ITER_STATS:-1}" == "1" ]]; then
+  common+=(--iter-stats)
+fi
 # Tail positions a beam carries before its last token.
 max_tail=$(( OUTPUT_LEN > 1 ? OUTPUT_LEN - 1 : 1 ))
 
@@ -138,7 +142,14 @@ for key in sorted(rows):
         else:
             pre = d.get("prefill_ms_median")
             dec = d.get("decode_ms_median")
-            split = f" ({pre:.1f}+{dec:.1f})" if pre is not None and dec is not None else ""
+            queue = d.get("queue_ms_median")
+            split = ""
+            if pre is not None and dec is not None:
+                split = f" (q {queue:.1f} + p {pre:.1f} + d {dec:.1f})" if queue is not None \
+                    else f" (p {pre:.1f} + d {dec:.1f})"
+            iters = d.get("iter_latency_sum_ms_median")
+            if iters is not None:
+                split += f" [iters {iters:.1f}]"
             cells.append(f"{d['wall_ms_median']:.2f}{split}")
     gr = gr_ms(key)
     cells.append(f"{gr:.2f}" if gr is not None else "")
@@ -146,5 +157,6 @@ for key in sorted(rows):
 text = "\n".join(lines)
 (root / "comparison.md").write_text(text + "\n", encoding="utf-8")
 print(text)
-print(f"\nwrote {root / 'comparison.md'}  (cells: wall ms (prefill+decode))")
+print(f"\nwrote {root / 'comparison.md'}  (cells: wall ms (q queue + p prefill + d decode) "
+      "[sum of executor iteration latencies])")
 PY

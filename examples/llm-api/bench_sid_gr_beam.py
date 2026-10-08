@@ -230,6 +230,8 @@ def build_llm(args, *, max_context_len: int, max_beam_width: int,
             batch_sizes=sorted(set(args.batch_sizes)))
     if args.attn_backend:
         kwargs["attn_backend"] = args.attn_backend
+    if args.iter_stats:
+        kwargs["enable_iter_perf_stats"] = True
     if args.extra_llm_api_options:
         import yaml
         extra = yaml.safe_load(Path(args.extra_llm_api_options).read_text()) or {}
@@ -262,7 +264,11 @@ def _timing_split(outputs) -> dict[str, Optional[float]]:
     """
     arrival, scheduled, first, last = [], [], [], []
     for out in outputs:
+        # The PyTorch result path attaches the per-request metrics to each
+        # CompletionOutput (identical across beams), not to the RequestOutput.
         pm = getattr(out, "request_perf_metrics", None)
+        if pm is None and out.outputs:
+            pm = getattr(out.outputs[0], "request_perf_metrics", None)
         tm = getattr(pm, "timing_metrics", None) if pm is not None else None
         if tm is None:
             continue
@@ -312,11 +318,24 @@ def run_offline_case(llm, args, *, context_len: int, beam_width: int,
     # when the executor runs in its own worker process.
     def run_once() -> tuple[float, list]:
         start = time.perf_counter()
-        outputs = llm.generate(prompts, sampling_params=sampling)
+        outputs = llm.generate(prompts, sampling_params=sampling, use_tqdm=False)
         return (time.perf_counter() - start) * 1000.0, outputs
+
+    def drain_iter_stats() -> list[dict]:
+        if not args.iter_stats:
+            return []
+        stats = []
+        # Stats are queued per executor iteration; collect everything emitted
+        # so far (the queue is empty once a short timeout expires).
+        while True:
+            chunk = llm.get_stats(timeout=0.2)
+            if not chunk:
+                return stats
+            stats.extend(s if isinstance(s, dict) else json.loads(s) for s in chunk)
 
     for _ in range(args.warmup_runs):
         run_once()
+    drain_iter_stats()
 
     if args.cuda_profiler_range:
         torch.cuda.cudart().cudaProfilerStart()
@@ -327,6 +346,18 @@ def run_offline_case(llm, args, *, context_len: int, beam_width: int,
             run = {"wall_ms": wall_ms, **_timing_split(outputs)}
             run["generated_tokens"] = sum(
                 len(b.token_ids) for o in outputs for b in o.outputs)
+            if args.iter_stats:
+                iters = drain_iter_stats()
+                run["iterations"] = [{
+                    "iter": s.get("iter"),
+                    "latency_ms": s.get("iterLatencyMS"),
+                    "queue_latency_ms": s.get("newActiveRequestsQueueLatencyMS"),
+                    "num_active": s.get("numActiveRequests"),
+                    "num_ctx": s.get("inflightBatchingStats", {}).get("numContextRequests"),
+                    "num_gen": s.get("inflightBatchingStats", {}).get("numGenRequests"),
+                } for s in iters]
+                run["iter_latency_sum_ms"] = sum(
+                    float(s.get("iterLatencyMS") or 0.0) for s in iters)
             runs.append((run, outputs))
     finally:
         if args.cuda_profiler_range:
@@ -355,6 +386,11 @@ def run_offline_case(llm, args, *, context_len: int, beam_width: int,
     }
     for key in ("queue_ms", "prefill_ms", "decode_ms"):
         result[f"{key}_median"] = median(r[key] for r, _ in runs)
+    if args.iter_stats:
+        result["iter_latency_sum_ms_median"] = median(
+            r.get("iter_latency_sum_ms") for r, _ in runs)
+        result["num_iterations_median"] = median(
+            len(r.get("iterations", [])) for r, _ in runs)
     if args.record_outputs:
         result["outputs"] = [{
             "request_index": idx,
@@ -398,8 +434,11 @@ def cmd_offline(args) -> None:
                     result["llm_kwargs"] = llm_kwargs
                     write_json(out_dir / f"trtllm_{suffix}.json", result)
                     print(f"  wall_ms_median={fmt(result['wall_ms_median'])} "
+                          f"queue_ms={fmt(result['queue_ms_median'])} "
                           f"prefill_ms={fmt(result['prefill_ms_median'])} "
                           f"decode_ms={fmt(result['decode_ms_median'])} "
+                          f"iter_sum_ms={fmt(result.get('iter_latency_sum_ms_median'))} "
+                          f"iters={result.get('num_iterations_median', '')} "
                           f"samples={[round(w, 3) for w in result['wall_ms_samples']]}",
                           flush=True)
     finally:
@@ -617,6 +656,9 @@ def build_parser() -> argparse.ArgumentParser:
     off.add_argument("--extra-llm-api-options", help="YAML merged into LLM kwargs last")
     off.add_argument("--no-perf-metrics", action="store_true",
                      help="Skip return_perf_metrics (loses prefill/decode split, removes its overhead)")
+    off.add_argument("--iter-stats", action="store_true",
+                     help="Enable executor iteration stats and record per-iteration latency "
+                     "(sum vs wall time separates executor time from API/response overhead)")
     off.add_argument("--cuda-profiler-range", action="store_true",
                      help="cudaProfilerStart/Stop around timed runs (needs --single-process)")
     # Process / attention variants (become env vars before tensorrt_llm is imported).
