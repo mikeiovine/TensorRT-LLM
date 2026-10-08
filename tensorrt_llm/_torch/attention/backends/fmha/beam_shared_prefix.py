@@ -869,17 +869,22 @@ def _check_prefix_against_reference(
                                                      head_dim)
         got_lse = prefix_lse[row0:row1].view(plan.beam_width, num_kv_heads, group)
         keep = ~indices.prefix_empty[row0:row1].view(-1, 1, 1)
-        worst_out = max(worst_out, float(((ref_out - got_out).abs() * keep.unsqueeze(-1)).max()))
+        # The kernel writes bf16/fp16 output, so compare with a tolerance
+        # relative to the reference magnitude (bf16 keeps ~3 significant
+        # digits); the LSE is fp32 and must match tightly.
+        out_err = (ref_out - got_out).abs() / (ref_out.abs() + 1.0)
+        worst_out = max(worst_out, float((out_err * keep.unsqueeze(-1)).max()))
         worst_lse = max(worst_lse, float(((ref_lse - got_lse).abs() * keep).max()))
     tol_out, tol_lse = 2e-2, 2e-2
     if worst_out > tol_out or worst_lse > tol_lse:
         raise RuntimeError(
             f"{LIB_NAME} check: FlashInfer prefix attention disagrees with the dense reference "
-            f"at layer {layer_idx}: max |out| diff {worst_out:.4f}, max |lse2| diff "
-            f"{worst_lse:.4f} (backend {_backend_from_env()})"
+            f"at layer {layer_idx}: max |out| diff / (1 + |ref|) {worst_out:.4f}, max |lse2| "
+            f"diff {worst_lse:.4f} (backend {_backend_from_env()})"
         )
     logger.info(f"{LIB_NAME} check: layer {layer_idx} prefix attention matches the dense "
-                f"reference (max |out| diff {worst_out:.2e}, max |lse2| diff {worst_lse:.2e})")
+                f"reference (max relative |out| diff {worst_out:.2e}, "
+                f"max |lse2| diff {worst_lse:.2e})")
 
 
 __all__ = [
