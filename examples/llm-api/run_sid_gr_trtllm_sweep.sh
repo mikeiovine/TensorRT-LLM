@@ -95,6 +95,8 @@ for variant in ${VARIANTS}; do
       [[ "${SINGLE_PROCESS}" == "1" ]] && args+=(--single-process)
       if [[ "${variant}" == "flashinfer_pcg" ]]; then
         args+=(--prefill-cuda-graph "${PREFILL_CUDA_GRAPH}")
+        # SPEC_BEAM_D2H=0 keeps the per-step beam-history snapshot.
+        [[ "${SPEC_BEAM_D2H:-1}" == "1" ]] && args+=(--speculative-beam-d2h)
       fi
       if [[ -n "${FLASHINFER_BACKEND:-}" ]]; then
         args+=(--env "TLLM_BEAM_SHARED_PREFIX_BACKEND=${FLASHINFER_BACKEND}")

@@ -232,6 +232,10 @@ def build_llm(args, *, max_context_len: int, max_beam_width: int,
         kwargs["attn_backend"] = args.attn_backend
     if args.iter_stats:
         kwargs["enable_iter_perf_stats"] = True
+    if args.speculative_beam_d2h:
+        # Skips the per-step beam-history device-to-host snapshot on steps the
+        # sampler predicts cannot finish; exact for fixed-length generation.
+        kwargs["enable_speculative_beam_history_d2h"] = True
     if args.prefill_cuda_graph != "disabled":
         # One bucket per (batch, context length) the sweep will prefill in a
         # single step; the engine pads a context batch up to the next bucket.
@@ -699,6 +703,9 @@ def build_parser() -> argparse.ArgumentParser:
                      "(batch x context_len) token bucket: 'breakable' is the native runner, "
                      "'piecewise' goes through torch.compile. The eager prefill step is "
                      "host-launch bound at these sizes.")
+    off.add_argument("--speculative-beam-d2h", action="store_true",
+                     help="enable_speculative_beam_history_d2h: skip the beam-history "
+                     "device-to-host snapshot on non-final steps")
     off.add_argument("--iter-stats", action="store_true",
                      help="Enable executor iteration stats and record per-iteration latency "
                      "(sum vs wall time separates executor time from API/response overhead)")

@@ -547,6 +547,73 @@ class GenerationResultBase:
         if self._done:
             self.do_tracing(output, req_perf_metrics_dict)
 
+    def _handle_beam_sequences_fast(self, finish_reasons, response_tensors,
+                                    output_token_ids, request_perf_metrics,
+                                    *, logprobs_result, req_perf_metrics_dict,
+                                    context_phase_params) -> bool:
+        """Fill every beam of a final, plain beam-search response in one pass.
+
+        ``_handle_sequence`` does a few dozen attribute reads and branches per
+        beam; at wide beams that loop dominates the client side of the
+        response. This path covers the common case -- the request is done,
+        non-streaming, not disaggregated, no log-probs / logits / additional
+        outputs / metrics / tracing to attach, and every beam ended by length
+        or end-id -- with the same resulting ``CompletionOutput`` fields.
+        Returns False when any condition fails so the caller takes the
+        general per-beam path.
+        """
+        if (not self._done or getattr(self, "_streaming", False)
+                or logprobs_result is not None or req_perf_metrics_dict
+                or context_phase_params is not None
+                or self.disaggregated_params is not None
+                or response_tensors.log_probs is not None
+                or response_tensors.generation_logits is not None
+                or getattr(response_tensors, 'additional_context_outputs',
+                           None) is not None
+                or getattr(response_tensors, 'additional_generation_outputs',
+                           None) is not None or tracing.global_otlp_tracer()):
+            return False
+        num_beams = len(output_token_ids)
+        if not finish_reasons or len(finish_reasons) < num_beams:
+            return False
+        end_id = tllm.FinishReason.END_ID
+        length = tllm.FinishReason.LENGTH
+        reasons = []
+        for reason in finish_reasons[:num_beams]:
+            if reason == end_id:
+                reasons.append('stop')
+            elif reason == length:
+                reasons.append('length')
+            else:
+                return False
+
+        prefix = (self.sampling_params._decoder_output_token_prefix
+                  if self.sampling_params.exclude_input_from_output else ())
+        cum_log_probs = response_tensors.cum_log_probs
+        counters = _SpecDecCounters(
+            per_pos_drafted=getattr(response_tensors, 'per_pos_drafted', None),
+            per_pos_accepted=getattr(response_tensors, 'per_pos_accepted',
+                                     None),
+            spec_dec_totals=getattr(response_tensors, 'spec_dec_totals', None))
+        if request_perf_metrics is not None:
+            self._maybe_fill_spec_dec_perf_metrics(request_perf_metrics)
+        for beam_idx in range(num_beams):
+            output = self._outputs[beam_idx]
+            output.disaggregated_params = None
+            output._last_token_ids_len = len(output.token_ids)
+            output._last_logprobs_len = len(output.logprobs)
+            output._spec_dec_counters = counters
+            output.token_ids = [*prefix, *output_token_ids[beam_idx]]
+            if cum_log_probs is not None:
+                output.cumulative_logprob = cum_log_probs[beam_idx]
+            if request_perf_metrics is not None:
+                output.request_perf_metrics = request_perf_metrics
+            output.finish_reason = reasons[beam_idx]
+        if hasattr(response_tensors, 'time_breakdown_metrics'
+                   ) and response_tensors.time_breakdown_metrics is not None:
+            self.time_breakdown_metrics = response_tensors.time_breakdown_metrics
+        return True
+
     @staticmethod
     def _trim_stop_word_outputs(output: CompletionOutput,
                                 num_stop_ids: int) -> None:
@@ -697,14 +764,24 @@ class GenerationResultBase:
             output_token_ids = response_result.output_token_ids
             request_perf_metrics = response_result.request_perf_metrics
             if self.sampling_params.use_beam_search:
-                for beam_idx in range(len(output_token_ids)):
-                    self._handle_sequence(finish_reasons,
-                                          response_result,
-                                          beam_idx,
-                                          logprobs_result,
-                                          req_perf_metrics_dict,
-                                          output_token_ids=output_token_ids,
-                                          request_perf_metrics=request_perf_metrics)
+                handled = self._handle_beam_sequences_fast(
+                    finish_reasons,
+                    response_result,
+                    output_token_ids,
+                    request_perf_metrics,
+                    logprobs_result=logprobs_result,
+                    req_perf_metrics_dict=req_perf_metrics_dict,
+                    context_phase_params=context_phase_params)
+                if not handled:
+                    for beam_idx in range(len(output_token_ids)):
+                        self._handle_sequence(
+                            finish_reasons,
+                            response_result,
+                            beam_idx,
+                            logprobs_result,
+                            req_perf_metrics_dict,
+                            output_token_ids=output_token_ids,
+                            request_perf_metrics=request_perf_metrics)
             else:
                 self._handle_sequence(finish_reasons,
                                       response_result,
