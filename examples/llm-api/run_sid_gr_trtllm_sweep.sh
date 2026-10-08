@@ -14,8 +14,10 @@
 #   mmha            legacy per-beam MMHA decode attention, worker in a separate process
 #   cascade         TRTLLM_ENABLE_CASCADE_MMHA=1 (shared-prefix C++ kernels)
 #   flashinfer      cascade + TLLM_FMHA_LIBS=+beam_shared_prefix (FlashInfer shared-prefix library)
-#   flashinfer_pcg  flashinfer + prefill CUDA graphs (PREFILL_CUDA_GRAPH=breakable|piecewise,
-#                   default breakable): removes the eager-launch overhead of the context step
+#   flashinfer_pcg  flashinfer + piecewise (torch.compile) prefill CUDA graphs: attention stays
+#                   eager, works at every batch size
+#   flashinfer_bcg  flashinfer + breakable prefill CUDA graphs: attention captured too (fastest
+#                   context step); prototype runner, validated at batch 1 only so far
 # Every variant except "mmha" runs the executor in-process (--single-process), which is how
 # the GR engine is timed. Set SINGLE_PROCESS=0 to keep the worker process everywhere.
 #
@@ -45,10 +47,7 @@ BEAM_WIDTHS="${BEAM_WIDTHS:-256}"
 OUTPUT_LEN="${OUTPUT_LEN:-3}"
 WARMUP_RUNS="${WARMUP_RUNS:-2}"
 OUT_ROOT="${OUT_ROOT:-benchmark_artifacts/sid_gr/trtllm_sweep_$(date +%Y%m%d_%H%M%S)}"
-VARIANTS="${VARIANTS:-mmha cascade flashinfer flashinfer_pcg}"
-# breakable captures attention inside the prefill graph; piecewise (torch.compile) keeps
-# attention eager and is the fallback if breakable misbehaves.
-PREFILL_CUDA_GRAPH="${PREFILL_CUDA_GRAPH:-breakable}"
+VARIANTS="${VARIANTS:-mmha cascade flashinfer flashinfer_pcg flashinfer_bcg}"
 SINGLE_PROCESS="${SINGLE_PROCESS:-1}"
 GR_DIR="${GR_DIR:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
@@ -92,11 +91,15 @@ for variant in ${VARIANTS}; do
       args+=(--cascade-mmha)
       [[ "${SINGLE_PROCESS}" == "1" ]] && args+=(--single-process)
       ;;
-    flashinfer|flashinfer_pcg)
+    flashinfer|flashinfer_pcg|flashinfer_bcg)
       args+=(--cascade-mmha --fmha-libs "+beam_shared_prefix" --beam-max-tail "${max_tail}")
       [[ "${SINGLE_PROCESS}" == "1" ]] && args+=(--single-process)
-      if [[ "${variant}" == "flashinfer_pcg" ]]; then
-        args+=(--prefill-cuda-graph "${PREFILL_CUDA_GRAPH}")
+      if [[ "${variant}" != "flashinfer" ]]; then
+        if [[ "${variant}" == "flashinfer_pcg" ]]; then
+          args+=(--prefill-cuda-graph piecewise)
+        else
+          args+=(--prefill-cuda-graph breakable)
+        fi
         # SPEC_BEAM_D2H=0 keeps the per-step beam-history snapshot.
         [[ "${SPEC_BEAM_D2H:-1}" == "1" ]] && args+=(--speculative-beam-d2h)
       fi
