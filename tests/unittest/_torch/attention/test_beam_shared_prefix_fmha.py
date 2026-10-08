@@ -183,7 +183,8 @@ def test_fused_tail_merge_large_page_offsets():
     """
     num_kv_heads, head_dim, page_size, layers = 2, 128, 32, 4
     page_elems = layers * 2 * num_kv_heads * page_size * head_dim
-    pages = 2**31 // page_elems + 64
+    # 64 pages past the first one whose offset exceeds 2**31 elements.
+    pages = 2**31 // page_elems + 1 + 64
     needed = pages * page_elems * 2
     free, _ = torch.cuda.mem_get_info()
     if free < needed + (1 << 30):
