@@ -232,6 +232,20 @@ def build_llm(args, *, max_context_len: int, max_beam_width: int,
         kwargs["attn_backend"] = args.attn_backend
     if args.iter_stats:
         kwargs["enable_iter_perf_stats"] = True
+    if args.prefill_cuda_graph != "disabled":
+        # One bucket per (batch, context length) the sweep will prefill in a
+        # single step; the engine pads a context batch up to the next bucket.
+        buckets = sorted({
+            batch * ctx
+            for batch in args.batch_sizes for ctx in args.context_lens
+            if batch * ctx <= max_num_tokens
+        })
+        kwargs["prefill_cuda_graph_backend"] = args.prefill_cuda_graph
+        kwargs["prefill_capture_num_tokens"] = buckets
+        if args.prefill_cuda_graph == "piecewise":
+            from tensorrt_llm.llmapi import TorchCompileConfig
+            kwargs["torch_compile_config"] = TorchCompileConfig(
+                enable_fullgraph=False, enable_inductor=False)
     if args.extra_llm_api_options:
         import yaml
         extra = yaml.safe_load(Path(args.extra_llm_api_options).read_text()) or {}
@@ -256,11 +270,17 @@ def make_sampling_params(beam_width: int, output_len: int,
     )
 
 
-def _timing_split(outputs) -> dict[str, Optional[float]]:
+def _timing_split(outputs, start_mono: Optional[float] = None,
+                  end_mono: Optional[float] = None) -> dict[str, Optional[float]]:
     """Prefill / decode split from RequestPerfMetrics timing (ms).
 
     Valid when every request in the run is scheduled in the same batch, which
     is the case for the offline sweep (batch <= max_batch_size).
+
+    The executor stamps its times with the C++ steady clock, which on Linux is
+    the clock behind ``time.monotonic()``; given the monotonic start/end of the
+    ``generate`` call this also reports the client-side legs: ``submit_ms``
+    (call to executor arrival) and ``response_ms`` (last token to return).
     """
     arrival, scheduled, first, last = [], [], [], []
     for out in outputs:
@@ -277,12 +297,24 @@ def _timing_split(outputs) -> dict[str, Optional[float]]:
         first.append(tm.first_token_time.total_seconds())
         last.append(tm.last_token_time.total_seconds())
     if not first:
-        return {"queue_ms": None, "prefill_ms": None, "decode_ms": None}
-    return {
+        return {"queue_ms": None, "prefill_ms": None, "decode_ms": None,
+                "submit_ms": None, "response_ms": None}
+    split: dict[str, Optional[float]] = {
         "queue_ms": (min(scheduled) - min(arrival)) * 1000.0,
         "prefill_ms": (max(first) - min(scheduled)) * 1000.0,
         "decode_ms": (max(last) - max(first)) * 1000.0,
+        "submit_ms": None,
+        "response_ms": None,
     }
+    if start_mono is not None and end_mono is not None:
+        submit = (min(arrival) - start_mono) * 1000.0
+        response = (end_mono - max(last)) * 1000.0
+        # Only meaningful when both clocks agree (same steady clock); a
+        # negative leg means they do not, and the legs are left unset.
+        if submit >= 0 and response >= 0:
+            split["submit_ms"] = submit
+            split["response_ms"] = response
+    return split
 
 
 def _beam_results(output) -> list[dict[str, Any]]:
@@ -316,10 +348,12 @@ def run_offline_case(llm, args, *, context_len: int, beam_width: int,
     # on the host, so wall time needs no device synchronize. Avoiding CUDA
     # calls here also keeps the parent process from allocating a CUDA context
     # when the executor runs in its own worker process.
-    def run_once() -> tuple[float, list]:
+    def run_once() -> tuple[float, list, float, float]:
+        start_mono = time.monotonic()
         start = time.perf_counter()
         outputs = llm.generate(prompts, sampling_params=sampling, use_tqdm=False)
-        return (time.perf_counter() - start) * 1000.0, outputs
+        wall_ms = (time.perf_counter() - start) * 1000.0
+        return wall_ms, outputs, start_mono, time.monotonic()
 
     def drain_iter_stats() -> list[dict]:
         if not args.iter_stats:
@@ -342,8 +376,8 @@ def run_offline_case(llm, args, *, context_len: int, beam_width: int,
     runs = []
     try:
         for _ in range(args.repeat):
-            wall_ms, outputs = run_once()
-            run = {"wall_ms": wall_ms, **_timing_split(outputs)}
+            wall_ms, outputs, start_mono, end_mono = run_once()
+            run = {"wall_ms": wall_ms, **_timing_split(outputs, start_mono, end_mono)}
             run["generated_tokens"] = sum(
                 len(b.token_ids) for o in outputs for b in o.outputs)
             if args.iter_stats:
@@ -384,8 +418,8 @@ def run_offline_case(llm, args, *, context_len: int, beam_width: int,
         "qps": requests / (wall_median / 1000.0) if wall_median else None,
         "runs": [r for r, _ in runs],
     }
-    for key in ("queue_ms", "prefill_ms", "decode_ms"):
-        result[f"{key}_median"] = median(r[key] for r, _ in runs)
+    for key in ("queue_ms", "prefill_ms", "decode_ms", "submit_ms", "response_ms"):
+        result[f"{key}_median"] = median(r.get(key) for r, _ in runs)
     if args.iter_stats:
         result["iter_latency_sum_ms_median"] = median(
             r.get("iter_latency_sum_ms") for r, _ in runs)
@@ -434,9 +468,11 @@ def cmd_offline(args) -> None:
                     result["llm_kwargs"] = llm_kwargs
                     write_json(out_dir / f"trtllm_{suffix}.json", result)
                     print(f"  wall_ms_median={fmt(result['wall_ms_median'])} "
+                          f"submit_ms={fmt(result['submit_ms_median'])} "
                           f"queue_ms={fmt(result['queue_ms_median'])} "
                           f"prefill_ms={fmt(result['prefill_ms_median'])} "
                           f"decode_ms={fmt(result['decode_ms_median'])} "
+                          f"response_ms={fmt(result['response_ms_median'])} "
                           f"iter_sum_ms={fmt(result.get('iter_latency_sum_ms_median'))} "
                           f"iters={result.get('num_iterations_median', '')} "
                           f"samples={[round(w, 3) for w in result['wall_ms_samples']]}",
@@ -656,6 +692,13 @@ def build_parser() -> argparse.ArgumentParser:
     off.add_argument("--extra-llm-api-options", help="YAML merged into LLM kwargs last")
     off.add_argument("--no-perf-metrics", action="store_true",
                      help="Skip return_perf_metrics (loses prefill/decode split, removes its overhead)")
+    off.add_argument("--prefill-cuda-graph",
+                     choices=["disabled", "breakable", "piecewise"],
+                     default="disabled",
+                     help="Capture the prefill (context) forward in a CUDA graph per "
+                     "(batch x context_len) token bucket: 'breakable' is the native runner, "
+                     "'piecewise' goes through torch.compile. The eager prefill step is "
+                     "host-launch bound at these sizes.")
     off.add_argument("--iter-stats", action="store_true",
                      help="Enable executor iteration stats and record per-iteration latency "
                      "(sum vs wall time separates executor time from API/response overhead)")

@@ -11,9 +11,11 @@
 #   GR_DIR=/path/to/gr_offline examples/llm-api/run_sid_gr_trtllm_sweep.sh   # side-by-side with GR
 #
 # Variants:
-#   mmha        legacy per-beam MMHA decode attention, worker in a separate process
-#   cascade     TRTLLM_ENABLE_CASCADE_MMHA=1 (shared-prefix C++ kernels)
-#   flashinfer  cascade + TLLM_FMHA_LIBS=+beam_shared_prefix (FlashInfer shared-prefix library)
+#   mmha            legacy per-beam MMHA decode attention, worker in a separate process
+#   cascade         TRTLLM_ENABLE_CASCADE_MMHA=1 (shared-prefix C++ kernels)
+#   flashinfer      cascade + TLLM_FMHA_LIBS=+beam_shared_prefix (FlashInfer shared-prefix library)
+#   flashinfer_pcg  flashinfer + prefill CUDA graphs (PREFILL_CUDA_GRAPH=breakable|piecewise,
+#                   default breakable): removes the eager-launch overhead of the context step
 # Every variant except "mmha" runs the executor in-process (--single-process), which is how
 # the GR engine is timed. Set SINGLE_PROCESS=0 to keep the worker process everywhere.
 #
@@ -43,7 +45,8 @@ BEAM_WIDTHS="${BEAM_WIDTHS:-256}"
 OUTPUT_LEN="${OUTPUT_LEN:-3}"
 WARMUP_RUNS="${WARMUP_RUNS:-2}"
 OUT_ROOT="${OUT_ROOT:-benchmark_artifacts/sid_gr/trtllm_sweep_$(date +%Y%m%d_%H%M%S)}"
-VARIANTS="${VARIANTS:-mmha cascade flashinfer}"
+VARIANTS="${VARIANTS:-mmha cascade flashinfer flashinfer_pcg}"
+PREFILL_CUDA_GRAPH="${PREFILL_CUDA_GRAPH:-breakable}"
 SINGLE_PROCESS="${SINGLE_PROCESS:-1}"
 GR_DIR="${GR_DIR:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
@@ -87,9 +90,12 @@ for variant in ${VARIANTS}; do
       args+=(--cascade-mmha)
       [[ "${SINGLE_PROCESS}" == "1" ]] && args+=(--single-process)
       ;;
-    flashinfer)
+    flashinfer|flashinfer_pcg)
       args+=(--cascade-mmha --fmha-libs "+beam_shared_prefix" --beam-max-tail "${max_tail}")
       [[ "${SINGLE_PROCESS}" == "1" ]] && args+=(--single-process)
+      if [[ "${variant}" == "flashinfer_pcg" ]]; then
+        args+=(--prefill-cuda-graph "${PREFILL_CUDA_GRAPH}")
+      fi
       if [[ -n "${FLASHINFER_BACKEND:-}" ]]; then
         args+=(--env "TLLM_BEAM_SHARED_PREFIX_BACKEND=${FLASHINFER_BACKEND}")
       fi
