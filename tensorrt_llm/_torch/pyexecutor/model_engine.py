@@ -5768,8 +5768,14 @@ class PyTorchModelEngine(ModelEngine):
                     dtype=torch.long,
                     pin_memory=prefer_pinned()).to(device='cuda',
                                                    non_blocking=True)
-                self.cache_indirection_attention[:num_generation_requests].copy_(
-                    cache_indirection_buffer[gen_request_seq_slots_tensor])
+                # Gather straight into the persistent attention buffer: one
+                # kernel and no temporary (the rows are [beam, max_seq_len]).
+                torch.index_select(
+                    cache_indirection_buffer,
+                    0,
+                    gen_request_seq_slots_tensor,
+                    out=self.
+                    cache_indirection_attention[:num_generation_requests])
             if cache_indirection_buffer is not None or is_dummy:
                 attn_metadata.beam_width = self.max_beam_width
         else:

@@ -1484,6 +1484,7 @@ def convert_logprobs_tensor_to_list(
     return token_log_probs
 
 
+@nvtx_range("finalize_beam")
 def finalize_beam(
     request: LlmRequest,
     beam_history: BeamHistory,

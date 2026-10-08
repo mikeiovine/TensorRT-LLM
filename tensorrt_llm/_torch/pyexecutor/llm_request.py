@@ -13,7 +13,7 @@ import torch
 
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
 from tensorrt_llm.inputs.multimodal import strip_mm_encoder_inputs
@@ -1216,6 +1216,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # reads it as an attribute.
         return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
 
+    @nvtx_range("create_response")
     def create_response(self,
                         use_fast_logits=False,
                         mpi_world_rank=0) -> LlmResponse | None:

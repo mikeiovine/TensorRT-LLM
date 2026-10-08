@@ -1228,6 +1228,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # row (every position counts) or a row finishing at beam 0 (none do).
         return (unfinished.cumsum(dim=1) == 0).sum(dim=1).tolist()
 
+    @nvtx_range("_handle_first_finish_reasons")
     def _handle_first_finish_reasons(
         self,
         request: LlmRequest,

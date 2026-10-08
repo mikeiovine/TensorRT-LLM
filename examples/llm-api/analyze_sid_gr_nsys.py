@@ -101,17 +101,21 @@ def read_nvtx(path: Path) -> list[tuple[int, int, int, str]]:
 
 
 def attribute_gaps(gaps: list[tuple[int, int]],
-                   ranges: list[tuple[int, int, int, str]]) -> dict[str, int]:
-    """Charge each idle gap to the innermost NVTX range covering its midpoint.
+                   ranges: list[tuple[int, int, int, str]],
+                   at: str = "mid") -> dict[str, int]:
+    """Charge each idle gap to the innermost NVTX range active at a point of it.
 
-    Gaps that no range covers are charged to ``<no nvtx range>``; a gap that
-    only the outermost ranges cover usually means Python outside the annotated
-    executor stages (request/response handling, the API thread).
+    ``at="mid"`` uses the gap's midpoint (where the host spent the bulk of the
+    idle time), ``at="start"`` the moment the GPU ran dry (what the host was
+    doing when it fell behind). Gaps that no range covers are charged to
+    ``<no nvtx range>``; a gap that only the outermost ranges cover usually
+    means Python outside the annotated executor stages (request/response
+    handling, the API thread).
     """
     owners: dict[str, int] = defaultdict(int)
     starts = [r[0] for r in ranges]
     for gap_start, gap_end in gaps:
-        mid = (gap_start + gap_end) // 2
+        mid = (gap_start + gap_end) // 2 if at == "mid" else gap_start + 1
         # Candidate ranges start before the midpoint; scan back for the
         # deepest one that also ends after it (ranges nest, so the walk is short
         # in practice but bounded for safety).
@@ -198,11 +202,13 @@ def main() -> None:
     print()
     if args.nvtx_csv:
         ranges = read_nvtx(Path(args.nvtx_csv))
-        owners = attribute_gaps(gaps, ranges)
-        print(f"GPU-idle gaps by innermost host NVTX range ({len(ranges)} ranges):")
-        print(f"{'range':<64}{'idle ms / run':>14}")
-        for name, total in sorted(owners.items(), key=lambda kv: kv[1], reverse=True)[:25]:
-            print(f"{name[:63]:<64}{ms(total):>14.3f}")
+        for at, title in (("mid", "at the gap midpoint"), ("start", "when the GPU ran dry")):
+            owners = attribute_gaps(gaps, ranges, at=at)
+            print(f"GPU-idle gaps by innermost host NVTX range {title} ({len(ranges)} ranges):")
+            print(f"{'range':<64}{'idle ms / run':>14}")
+            for name, total in sorted(owners.items(), key=lambda kv: kv[1], reverse=True)[:20]:
+                print(f"{name[:63]:<64}{ms(total):>14.3f}")
+            print()
         # Inclusive host time of the annotated stages (children included, so
         # nested ranges are counted in their parents too).
         inclusive: dict[str, int] = defaultdict(int)
