@@ -686,7 +686,10 @@ class BeamSharedPrefixFmha(PhasedFmha):
         v = qkv[:, q_size + kv_size : q_size + 2 * kv_size].view(rows, num_kv_heads, head_dim)
 
         pool = self._pool_view(metadata)
-        check = _check_enabled()
+        # Checks synchronize and read device values, neither of which is
+        # permitted inside CUDA graph capture; the capture's warmup runs the
+        # same shapes eagerly first, so coverage is not lost.
+        check = _check_enabled() and not torch.cuda.is_current_stream_capturing()
         if check:
             _sync_checkpoint(f"layer {attn.layer_idx}: before step (error from an earlier op)")
             _check_plan(state, metadata, pool)
