@@ -97,22 +97,19 @@ def test_merge_prefix_and_tail_matches_dense_attention(tail_len, with_mask,
     torch.testing.assert_close(merged, expected, atol=1e-5, rtol=1e-4)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-@pytest.mark.parametrize("tail_len", [0, 1, 2, 5])
-@pytest.mark.parametrize("group", [1, 2])
-def test_fused_tail_merge_matches_torch_path(tail_len, group):
-    """The Triton tail+merge kernel reproduces merge_prefix_and_tail, reading
-    the tail K/V straight from a paged pool through page/slot indices."""
+def _check_fused_tail_merge(tail_len, group, pool, page_lo, page_hi):
+    """Run the Triton tail+merge kernel against merge_prefix_and_tail on
+    ``pool`` ([pages, 2, kv_heads, page_size, head_dim], any page stride),
+    drawing tail pages from [page_lo, page_hi)."""
     from tensorrt_llm._torch.attention.kernels.beam_tail_merge import \
         beam_tail_merge
 
     torch.manual_seed(0)
-    device = "cuda"
-    rows, num_kv_heads, head_dim, page_size, pages = 10, 2, 128, 32, 7
+    device = pool.device
+    rows = 10
+    _, _, num_kv_heads, page_size, head_dim = pool.shape
     num_heads = num_kv_heads * group
     sm_scale = 1.0 / math.sqrt(head_dim)
-    pool = torch.randn(pages, 2, num_kv_heads, page_size, head_dim,
-                       device=device, dtype=torch.bfloat16)
     # Packed QKV row layout, like the attention input the library receives.
     qkv = torch.randn(rows, (num_heads + 2 * num_kv_heads) * head_dim,
                       device=device, dtype=torch.bfloat16)
@@ -127,8 +124,12 @@ def test_fused_tail_merge_matches_torch_path(tail_len, group):
     prefix_empty = torch.zeros(rows, dtype=torch.bool, device=device)
     prefix_empty[-1] = True
     if tail_len > 0:
-        tail_page = torch.randint(0, pages, (rows, tail_len), device=device)
-        tail_slot = torch.randint(0, page_size, (rows, tail_len), device=device)
+        # int32, like the KV manager's block-offset table the library derives
+        # them from; the kernel must widen before forming pool offsets.
+        tail_page = torch.randint(page_lo, page_hi, (rows, tail_len),
+                                  device=device, dtype=torch.int32)
+        tail_slot = torch.randint(0, page_size, (rows, tail_len),
+                                  device=device, dtype=torch.int32)
         tail_valid = torch.rand(rows, tail_len, device=device) > 0.3
         k_tail = pool[tail_page, 0, :, tail_slot, :]
         v_tail = pool[tail_page, 1, :, tail_slot, :]
@@ -155,6 +156,46 @@ def test_fused_tail_merge_matches_torch_path(tail_len, group):
                     prefix_out, prefix_lse, prefix_empty, out,
                     sm_scale=sm_scale)
     torch.testing.assert_close(out.float(), expected, atol=3e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("tail_len", [0, 1, 2, 5])
+@pytest.mark.parametrize("group", [1, 2])
+def test_fused_tail_merge_matches_torch_path(tail_len, group):
+    """The Triton tail+merge kernel reproduces merge_prefix_and_tail, reading
+    the tail K/V straight from a paged pool through page/slot indices."""
+    torch.manual_seed(0)
+    num_kv_heads, head_dim, page_size, pages = 2, 128, 32, 7
+    pool = torch.randn(pages, 2, num_kv_heads, page_size, head_dim,
+                       device="cuda", dtype=torch.bfloat16)
+    _check_fused_tail_merge(tail_len, group, pool, 0, pages)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_fused_tail_merge_large_page_offsets():
+    """Pool offsets past 2**31 elements must not wrap.
+
+    The per-layer pool the library reads is a slice of the manager's
+    [pages, layers, 2, ...] buffer, so its page stride covers every layer and
+    page * stride leaves int32 range after about a thousand pages on a real
+    model. Reproduce that with a layer-strided view whose referenced pages sit
+    beyond the overflow point.
+    """
+    num_kv_heads, head_dim, page_size, layers = 2, 128, 32, 4
+    page_elems = layers * 2 * num_kv_heads * page_size * head_dim
+    pages = 2**31 // page_elems + 64
+    needed = pages * page_elems * 2
+    free, _ = torch.cuda.mem_get_info()
+    if free < needed + (1 << 30):
+        pytest.skip(f"needs {needed / 2**30:.1f} GiB of free GPU memory")
+    big = torch.empty(pages, layers, 2, num_kv_heads, page_size, head_dim,
+                      device="cuda", dtype=torch.bfloat16)
+    page_lo = pages - 64
+    big[page_lo:].normal_()
+    pool = big[:, 1]
+    assert pool.stride(0) == page_elems
+    assert page_lo * page_elems > 2**31
+    _check_fused_tail_merge(2, 2, pool, page_lo, pages)
 
 
 def _qwen3_small_path():

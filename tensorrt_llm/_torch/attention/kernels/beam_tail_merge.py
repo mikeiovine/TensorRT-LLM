@@ -47,9 +47,12 @@ def _beam_tail_merge_kernel(
     GROUP: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    kv_head = tl.program_id(1)
-    d = tl.arange(0, HEAD_DIM)
+    # Offsets are formed in 64 bits: the pool page stride spans every layer of
+    # the KV pool (layers * 2 * heads * page_size * head_dim elements), so
+    # page * stride exceeds int32 after roughly a thousand pages.
+    row = tl.program_id(0).to(tl.int64)
+    kv_head = tl.program_id(1).to(tl.int64)
+    d = tl.arange(0, HEAD_DIM).to(tl.int64)
 
     # Current token's K/V for this KV head (always attended, never masked).
     k_cur = tl.load(kcur_ptr + row * cur_stride_r + kv_head * cur_stride_h + d).to(tl.float32)
@@ -58,8 +61,8 @@ def _beam_tail_merge_kernel(
     if TAIL > 0:
         t = tl.arange(0, TAIL_PAD)
         in_tail = t < TAIL
-        page = tl.load(tail_page_ptr + row * tail_stride_r + t, mask=in_tail, other=0)
-        slot = tl.load(tail_slot_ptr + row * tail_stride_r + t, mask=in_tail, other=0)
+        page = tl.load(tail_page_ptr + row * tail_stride_r + t, mask=in_tail, other=0).to(tl.int64)
+        slot = tl.load(tail_slot_ptr + row * tail_stride_r + t, mask=in_tail, other=0).to(tl.int64)
         valid = tl.load(tail_valid_ptr + row * tail_stride_r + t, mask=in_tail, other=0)
         valid = (valid != 0) & in_tail
         kv_off = (page[:, None] * pool_stride_page + kv_head * pool_stride_h

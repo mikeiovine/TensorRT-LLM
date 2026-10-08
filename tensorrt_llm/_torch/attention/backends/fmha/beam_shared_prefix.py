@@ -471,7 +471,7 @@ def _step_indices(
     prompt_len = torch.minimum(prompt_len, current)
     prefix_empty = prompt_len < 1
     write_page = (offsets_k[cache_rows, (current // tokens_per_block).clamp(max=max_blocks - 1)]
-                  // state.page_stride).clamp(0, num_pages - 1)
+                  .to(torch.int64) // state.page_stride).clamp(0, num_pages - 1)
     write_slot = current % tokens_per_block
 
     tail_page = tail_slot = tail_valid = None
@@ -492,7 +492,8 @@ def _step_indices(
         src_beam = src_beam.to(torch.int64).clamp(0, beam_width - 1)
         src_rows = num_ctx + request_ids.view(-1, 1) * beam_width + src_beam
         blocks = (positions // tokens_per_block).clamp(max=max_blocks - 1)
-        tail_page = (offsets_k[src_rows, blocks] // state.page_stride).clamp(0, num_pages - 1)
+        tail_page = (offsets_k[src_rows, blocks].to(torch.int64)
+                     // state.page_stride).clamp(0, num_pages - 1)
         tail_slot = positions % tokens_per_block
 
     state.indices = _StepIndices(
