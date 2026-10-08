@@ -29,6 +29,8 @@ final once the winning path is known, so they are accumulated in
 :class:`BeamHistory` and emitted in one go by :func:`finalize_beam`.
 """
 
+import dataclasses
+import os
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from enum import IntEnum
@@ -40,6 +42,7 @@ from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.executor.result import Logprob
+from tensorrt_llm.logger import logger
 
 from ..llm_request import LlmRequest, LlmRequestState
 from .logprobs import LogProbsStore
@@ -343,6 +346,9 @@ class BeamSearchMetadata(StrategyMetadata):
     cba: Optional[CBAState] = None
     """Candidate-Beams-Array state, present for every beam-search request
     regardless of its early_stopping mode; None until the first one."""
+    graph_runner: Optional["BeamStepGraphRunner"] = None
+    """Replays the beam step as a CUDA graph when set (see
+    :class:`BeamStepGraphRunner`); None runs the eager op."""
 
 
 def _update_cache_indirection_buffer(
@@ -1035,6 +1041,155 @@ def beam_search_sampling_batch_cba(
     return _pad_next_tokens(slot_tok, args.finished_beams.size(1)), softmax
 
 
+BEAM_SAMPLER_GRAPH_ENV = "TLLM_BEAM_SAMPLER_CUDA_GRAPH"
+"""``0`` disables CUDA-graph replay of the beam-search step (default on)."""
+
+
+def beam_sampler_graph_enabled() -> bool:
+    return os.environ.get(BEAM_SAMPLER_GRAPH_ENV, "1") != "0"
+
+
+@dataclass
+class _BeamStepGraphEntry:
+    eager_runs: int = 0
+    disabled: bool = False
+    graph: Optional[torch.cuda.CUDAGraph] = None
+    logits: Optional[torch.Tensor] = None
+    seq_slots: Optional[torch.Tensor] = None
+    seq_lens: Optional[torch.Tensor] = None
+    tokens: Optional[torch.Tensor] = None
+
+
+class BeamStepGraphRunner:
+    """CUDA-graph replay of :func:`beam_search_sampling_batch_cba`.
+
+    The beam step is ~50 small device ops plus the compiled CBA math, all
+    launched from Python; at wide beams that host time is on the critical
+    path of the first and last steps of a request. Everything the op touches
+    is either a persistent store tensor or derived from the step's logits,
+    sequence slots and lengths, so for a fixed step shape the launch sequence
+    can be recorded once and replayed.
+
+    A step shape is keyed by the logits shape, beam widths, row stride,
+    stopping mode, scalar penalties, the CBA snapshot width (which grows by
+    one per generated token) and the group size. Each key runs eagerly
+    ``WARMUP_RUNS`` times first (the compiled math must have compiled for the
+    shape and torch.compile's automatic-dynamic recompile must have settled,
+    neither of which is allowed during capture), then is captured with
+    private static copies of the logits / slots / lengths and replayed. A
+    failed capture disables the key and falls back to eager for good.
+
+    Not used when the op must return probabilities, when a penalty is a
+    per-request tensor, or inside another capture.
+    """
+
+    WARMUP_RUNS = 2
+
+    def __init__(self) -> None:
+        self._entries: dict[tuple, _BeamStepGraphEntry] = {}
+        self._pool = None
+
+    def run(
+        self,
+        logits: torch.Tensor,
+        *,
+        beam_width_in: int,
+        beam_width_out: int,
+        row_stride: int | None,
+        beam_search_args: "BeamSearchMetadata",
+        early_stopping: int,
+        length_penalty: "torch.Tensor | float | None",
+        diversity_rate: "torch.Tensor | float | None",
+        return_probs: bool,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        def eager(logits_in: torch.Tensor, args: "BeamSearchMetadata"):
+            return beam_search_sampling_batch_cba(
+                logits_in,
+                beam_width_in=beam_width_in,
+                beam_width_out=beam_width_out,
+                row_stride=row_stride,
+                beam_search_args=args,
+                temperature=None,
+                early_stopping=early_stopping,
+                length_penalty=length_penalty,
+                diversity_rate=diversity_rate,
+                return_probs=return_probs,
+            )
+
+        cba = beam_search_args.cba
+        if (
+            return_probs
+            or cba is None
+            or not logits.is_cuda
+            or isinstance(length_penalty, torch.Tensor)
+            or isinstance(diversity_rate, torch.Tensor)
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return eager(logits, beam_search_args)
+
+        key = (
+            tuple(logits.shape),
+            logits.dtype,
+            beam_width_in,
+            beam_width_out,
+            row_stride or beam_width_in,
+            int(early_stopping),
+            float(length_penalty or 0.0),
+            float(diversity_rate or 0.0),
+            cba.max_gen_len,
+            cba.max_seq_len,
+            beam_search_args.seq_slots.shape[0],
+            beam_search_args.stop_past_tokens is not None,
+        )
+        entry = self._entries.setdefault(key, _BeamStepGraphEntry())
+        if entry.disabled or entry.eager_runs < self.WARMUP_RUNS:
+            entry.eager_runs += 1
+            return eager(logits, beam_search_args)
+
+        if entry.graph is None:
+            entry.logits = torch.empty_like(logits, memory_format=torch.contiguous_format)
+            entry.seq_slots = torch.empty_like(beam_search_args.seq_slots)
+            entry.seq_lens = torch.empty_like(beam_search_args.seq_lens)
+            static_args = dataclasses.replace(
+                beam_search_args, seq_slots=entry.seq_slots, seq_lens=entry.seq_lens
+            )
+            self._copy_inputs(entry, logits, beam_search_args)
+            graph = torch.cuda.CUDAGraph()
+            if self._pool is None:
+                self._pool = torch.cuda.graph_pool_handle()
+            try:
+                # Recording only: nothing executes until the replay below, so
+                # a failed capture leaves the stores untouched.
+                with torch.cuda.graph(graph, pool=self._pool, capture_error_mode="thread_local"):
+                    tokens, _ = eager(entry.logits, static_args)
+            except Exception as exc:  # noqa: BLE001 - any capture failure disables the key
+                logger.warning(
+                    f"Beam-search sampler CUDA graph capture failed for step shape {key}; "
+                    f"running this shape eagerly from now on ({exc!r})."
+                )
+                entry.disabled = True
+                entry.logits = entry.seq_slots = entry.seq_lens = None
+                return eager(logits, beam_search_args)
+            entry.graph = graph
+            entry.tokens = tokens
+        else:
+            self._copy_inputs(entry, logits, beam_search_args)
+
+        assert entry.graph is not None and entry.tokens is not None
+        entry.graph.replay()
+        return entry.tokens, None
+
+    @staticmethod
+    def _copy_inputs(
+        entry: _BeamStepGraphEntry, logits: torch.Tensor, args: "BeamSearchMetadata"
+    ) -> None:
+        assert entry.logits is not None and entry.seq_slots is not None
+        assert entry.seq_lens is not None
+        entry.logits.copy_(logits)
+        entry.seq_slots.copy_(args.seq_slots)
+        entry.seq_lens.copy_(args.seq_lens)
+
+
 BeamHistoryBuilder: TypeAlias = Callable[[], BeamHistory | None]
 """Builder for BeamHistory.
 
@@ -1426,6 +1581,9 @@ class BeamSearchHandler:
         # Stop-word length check lives with finish-reason handling, which also
         # uses it outside beam search; injected rather than duplicated here.
         self._has_multi_token_stop_words = has_multi_token_stop_words
+        self._graph_runner: Optional[BeamStepGraphRunner] = (
+            BeamStepGraphRunner() if store is not None and beam_sampler_graph_enabled() else None
+        )
 
     def build_metadata(
         self,
@@ -1479,6 +1637,7 @@ class BeamSearchHandler:
             predecessor_beams=store.predecessor_beams,
             beam_idx_arange=store.beam_idx_arange,
             stop_past_tokens=past_tokens_cuda,
+            graph_runner=self._graph_runner,
             # None unless a beam-search request has been
             # admitted; the CBA tensors are not allocated before that.
             cba=None

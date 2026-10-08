@@ -1161,6 +1161,18 @@ class _StrategyImpls:
         def _select_and_update(
             self, logits: torch.Tensor, group_metadata: BeamSearchMetadata
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            if group_metadata.graph_runner is not None:
+                return group_metadata.graph_runner.run(
+                    logits,
+                    beam_width_in=self._beam_width_in,
+                    beam_width_out=self._beam_width_out,
+                    row_stride=self._row_stride,
+                    beam_search_args=group_metadata,
+                    early_stopping=self._early_stopping,
+                    length_penalty=self._length_penalty,
+                    diversity_rate=self._diversity_rate,
+                    return_probs=self.computes_probs(),
+                )
             return beam_search_sampling_batch_cba(
                 logits,
                 beam_width_in=self._beam_width_in,

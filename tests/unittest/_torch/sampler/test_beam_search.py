@@ -2449,6 +2449,60 @@ def test_cba_finalize_reads_snapshot_from_token_base():
     torch.testing.assert_close(history.cum_logprobs, torch.tensor([2.0, 1.0]))
 
 
+@pytest.mark.threadleak(enabled=False)
+def test_beam_search_sampler_cuda_graph_matches_eager(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """CUDA-graph replay of the beam step reproduces the eager op.
+
+    Each step shape (snapshot width grows per token) runs eagerly twice before
+    it is captured, so three identical generate calls are needed before every
+    step of a request replays a graph; the third call's beams must match the
+    eager run token for token.
+    """
+    beam_width = 8
+    input_prompts = [[1, 2, 3], [4, 5, 6]]
+    checkpoint_loader = HfCheckpointLoader(
+        weight_loader=DummyWeightLoader(),
+        config_loader=DummyConfigLoader(),
+    )
+    sampling_params = SamplingParams(
+        max_tokens=6,
+        n=beam_width,
+        best_of=beam_width,
+        use_beam_search=True,
+        beam_search_diversity_rate=0.5,
+        end_id=-1,
+    )
+
+    def run(graph_enabled: bool):
+        monkeypatch.setenv("TLLM_BEAM_SAMPLER_CUDA_GRAPH",
+                           "1" if graph_enabled else "0")
+        gc.collect(2)
+        with _single_process_context():
+            llm = LLM(
+                model=_pl.Path("dummy_path"),
+                checkpoint_loader=checkpoint_loader,
+                max_beam_width=beam_width,
+                max_batch_size=beam_width * len(input_prompts),
+                max_seq_len=64,
+                kv_cache_config=KvCacheConfig(max_tokens=10000),
+                disable_overlap_scheduler=True,
+                cuda_graph_config=None,
+            )
+            with llm:
+                outputs = None
+                for _ in range(3 if graph_enabled else 1):
+                    outputs = llm.generate(deepcopy(input_prompts),
+                                           sampling_params=deepcopy(
+                                               sampling_params))
+        return [[tuple(beam.token_ids) for beam in out.outputs]
+                for out in outputs]
+
+    eager = run(False)
+    graphed = run(True)
+    assert graphed == eager
+
+
 def test_finish_beams():
     """Test TorchSampler._finish_beams method.
 
