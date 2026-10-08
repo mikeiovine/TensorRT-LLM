@@ -67,6 +67,12 @@ common=(
 if [[ "${ITER_STATS:-1}" == "1" ]]; then
   common+=(--iter-stats)
 fi
+# Per-request perf metrics make the client record metrics for every one of the 256
+# beams on the final response; off by default for timing runs (PERF_METRICS=1 enables
+# them for the queue/prefill/decode split).
+if [[ "${PERF_METRICS:-0}" != "1" ]]; then
+  common+=(--no-perf-metrics)
+fi
 # Tail positions a beam carries before its last token.
 max_tail=$(( OUTPUT_LEN > 1 ? OUTPUT_LEN - 1 : 1 ))
 

@@ -96,6 +96,18 @@ CHECK_ENV = "TLLM_BEAM_SHARED_PREFIX_CHECK"
 """Set to 1 to synchronize after every stage of the step and validate the
 page table and the prefix attention against dense references. Debugging aid:
 it serializes the GPU and must stay off for measurements."""
+FUSED_TAIL_ENV = "TLLM_BEAM_SHARED_PREFIX_FUSED_TAIL"
+"""``0`` disables the fused Triton tail-attention + merge kernel and runs the
+unfused torch ops instead (default: fused when Triton imports)."""
+
+try:
+    from tensorrt_llm._torch.attention.kernels.beam_tail_merge import beam_tail_merge
+except ImportError:  # Triton missing
+    beam_tail_merge = None
+
+
+def _fused_tail_enabled() -> bool:
+    return beam_tail_merge is not None and os.environ.get(FUSED_TAIL_ENV, "1") != "0"
 
 _LOG2E = 1.4426950408889634
 # Split-KV partial results of the prefix call. FlashInfer recommends 128 MB
@@ -722,7 +734,60 @@ class BeamSharedPrefixFmha(PhasedFmha):
                 num_kv_heads=num_kv_heads, sm_scale=sm_scale, layer_idx=attn.layer_idx,
             )
 
-        # 3. Tail: past generated positions via indirection, plus the current token.
+        output = params.output
+        if output is None:
+            raise RuntimeError(f"{type(self).__name__} requires an output tensor.")
+        output = output.view(rows, num_heads, head_dim)
+
+        # 3+4. Tail attention (past generated positions via indirection, plus
+        # the current token) merged with the prefix state. One fused kernel
+        # per layer; the torch ops below are the reference path.
+        use_fused = _fused_tail_enabled()
+        if use_fused:
+            beam_tail_merge(
+                q, k, v, pool,
+                indices.tail_page, indices.tail_slot, indices.tail_valid,
+                prefix_out, prefix_lse, indices.prefix_empty, output,
+                sm_scale=sm_scale,
+            )
+            if check:
+                _sync_checkpoint(f"layer {attn.layer_idx}: fused tail + merge")
+        if not use_fused or check:
+            merged = self._unfused_tail_and_merge(
+                pool, q, k, v, indices, plan, prefix_out, prefix_lse,
+                num_kv_heads=num_kv_heads, sm_scale=sm_scale,
+            )
+            if check:
+                _sync_checkpoint(f"layer {attn.layer_idx}: tail + merge (reference)")
+                if not torch.isfinite(merged).all():
+                    raise RuntimeError(
+                        f"{LIB_NAME} check: non-finite attention output at layer {attn.layer_idx}"
+                    )
+                if use_fused:
+                    err = ((output.float() - merged).abs() / (merged.abs() + 1.0)).max()
+                    if float(err) > 2e-2:
+                        raise RuntimeError(
+                            f"{LIB_NAME} check: fused tail kernel disagrees with the torch path "
+                            f"at layer {attn.layer_idx}: max relative diff {float(err):.4f}"
+                        )
+            if not use_fused:
+                output.copy_(merged.to(output.dtype))
+
+    def _unfused_tail_and_merge(
+        self,
+        pool: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        indices: _StepIndices,
+        plan: _HostPlan,
+        prefix_out: torch.Tensor,
+        prefix_lse: torch.Tensor,
+        *,
+        num_kv_heads: int,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        rows = q.shape[0]
         if plan.tail_len > 0:
             assert indices.tail_page is not None and indices.tail_slot is not None
             assert indices.tail_valid is not None
@@ -738,11 +803,7 @@ class BeamSharedPrefixFmha(PhasedFmha):
             k_all = k.unsqueeze(1)
             v_all = v.unsqueeze(1)
             valid = None
-        if check:
-            _sync_checkpoint(f"layer {attn.layer_idx}: tail gather")
-
-        # 4. Tail attention and log-sum-exp merge of the two partial states.
-        merged = merge_prefix_and_tail(
+        return merge_prefix_and_tail(
             q,
             k_all,
             v_all,
@@ -753,17 +814,6 @@ class BeamSharedPrefixFmha(PhasedFmha):
             sm_scale=sm_scale,
             prefix_empty=indices.prefix_empty,
         )
-        if check:
-            _sync_checkpoint(f"layer {attn.layer_idx}: tail + merge")
-            if not torch.isfinite(merged).all():
-                raise RuntimeError(
-                    f"{LIB_NAME} check: non-finite attention output at layer {attn.layer_idx}"
-                )
-
-        output = params.output
-        if output is None:
-            raise RuntimeError(f"{type(self).__name__} requires an output tensor.")
-        output.view(rows, num_heads, head_dim).copy_(merged.to(output.dtype))
 
 
 # --------------------------------------------------------------------------- #

@@ -5444,12 +5444,16 @@ class PyTorchModelEngine(ModelEngine):
                         helix_owned_new_tokens.append(
                             0 if request.py_helix_is_inactive_rank else 1)
 
-                for beam in range(beam_width):
-                    position_ids.append(position_id)
-                    num_cached_tokens_per_seq.append(
-                        past_seen_token_num - request.py_num_compressed_tokens)
-                    prompt_lengths.append(request.py_prompt_len)
-                    gather_ids.append(len(position_ids) - 1)
+                # Every beam of a request shares these per-row values; whole-
+                # list extends keep the wide-beam case off a Python loop.
+                first_gather_id = len(position_ids)
+                position_ids.extend([position_id] * beam_width)
+                num_cached_tokens_per_seq.extend(
+                    [past_seen_token_num - request.py_num_compressed_tokens] *
+                    beam_width)
+                prompt_lengths.extend([request.py_prompt_len] * beam_width)
+                gather_ids.extend(
+                    range(first_gather_id, first_gather_id + beam_width))
 
                 if _use_mrope:
                     mrope_position_delta = getattr(request,

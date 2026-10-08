@@ -18,17 +18,23 @@ Capture (executor in-process, profiler range around the timed runs)::
 
 Export and analyze::
 
-    nsys stats --report cuda_gpu_trace --format csv --output trtllm_sid_gr trtllm_sid_gr.nsys-rep
-    python examples/llm-api/analyze_sid_gr_nsys.py trtllm_sid_gr_cuda_gpu_trace.csv --repeat 3
+    nsys stats --report cuda_gpu_trace --report nvtx_pushpop_trace --format csv \\
+        --output trtllm_sid_gr trtllm_sid_gr.nsys-rep
+    python examples/llm-api/analyze_sid_gr_nsys.py trtllm_sid_gr_cuda_gpu_trace.csv \\
+        --nvtx-csv trtllm_sid_gr_nvtx_pushpop_trace.csv --repeat 3
 
 ``--cuda-graph-trace=node`` is required so kernels replayed inside CUDA graphs
 appear individually. ``--repeat`` divides totals by the number of timed runs
-inside the profiler range to report per-request-batch numbers.
+inside the profiler range to report per-request-batch numbers. With
+``--nvtx-csv`` every GPU-idle gap is attributed to the innermost host NVTX
+range active at that moment (the executor loop, sampler and model engine are
+annotated), which names the host code responsible for the idle time.
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 import sys
 from collections import defaultdict
@@ -76,6 +82,52 @@ def column(row: dict[str, str], *candidates: str) -> str | None:
     return None
 
 
+def read_nvtx(path: Path) -> list[tuple[int, int, int, str]]:
+    """(start, end, level, name) of every NVTX push/pop range."""
+    ranges = []
+    for row in read_trace(path):
+        start = column(row, "Start (ns)", "Start")
+        end = column(row, "End (ns)", "End")
+        name = column(row, "Name")
+        if start is None or end is None or name is None:
+            continue
+        level = int(float(column(row, "Lvl", "Level") or 0))
+        # Executor ranges embed the iteration counter; fold them together.
+        if name.startswith("[Executor] _forward_step"):
+            name = "[Executor] _forward_step"
+        ranges.append((int(float(start)), int(float(end)), level, name))
+    ranges.sort()
+    return ranges
+
+
+def attribute_gaps(gaps: list[tuple[int, int]],
+                   ranges: list[tuple[int, int, int, str]]) -> dict[str, int]:
+    """Charge each idle gap to the innermost NVTX range covering its midpoint.
+
+    Gaps that no range covers are charged to ``<no nvtx range>``; a gap that
+    only the outermost ranges cover usually means Python outside the annotated
+    executor stages (request/response handling, the API thread).
+    """
+    owners: dict[str, int] = defaultdict(int)
+    starts = [r[0] for r in ranges]
+    for gap_start, gap_end in gaps:
+        mid = (gap_start + gap_end) // 2
+        # Candidate ranges start before the midpoint; scan back for the
+        # deepest one that also ends after it (ranges nest, so the walk is short
+        # in practice but bounded for safety).
+        idx = bisect.bisect_right(starts, mid) - 1
+        best = None
+        scanned = 0
+        while idx >= 0 and scanned < 4096:
+            start, end, level, name = ranges[idx]
+            if end > mid and (best is None or level > best[2]):
+                best = (start, end, level, name)
+            idx -= 1
+            scanned += 1
+        owners[best[3] if best else "<no nvtx range>"] += gap_end - gap_start
+    return owners
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -85,6 +137,9 @@ def main() -> None:
     parser.add_argument("--gap-us", type=float, default=50.0,
                         help="Idle gaps between consecutive kernels longer than this count as CPU overhead")
     parser.add_argument("--top", type=int, default=15, help="Kernels to list per bucket")
+    parser.add_argument("--nvtx-csv",
+                        help="nsys stats --report nvtx_pushpop_trace CSV export; attributes "
+                        "GPU-idle gaps to the host NVTX range active at the time")
     args = parser.parse_args()
 
     rows = read_trace(Path(args.trace_csv))
@@ -107,6 +162,7 @@ def main() -> None:
     kernel_ns = sum(d for _, d, _ in kernels)
     gap_ns = 0
     gap_count = 0
+    gaps: list[tuple[int, int]] = []
     threshold_ns = int(args.gap_us * 1000)
     prev_end = kernels[0][0]
     for start, duration, _ in kernels:
@@ -114,6 +170,7 @@ def main() -> None:
         if gap > threshold_ns:
             gap_ns += gap
             gap_count += 1
+            gaps.append((prev_end, start))
         prev_end = max(prev_end, start + duration)
 
     per_bucket_ns: dict[str, int] = defaultdict(int)
@@ -139,6 +196,25 @@ def main() -> None:
     for bucket in [b for b, _ in BUCKETS] + ["other"]:
         print(f"{bucket:<24}{ms(per_bucket_ns[bucket]):>12.3f}{per_bucket_count[bucket] / rep:>18.1f}")
     print()
+    if args.nvtx_csv:
+        ranges = read_nvtx(Path(args.nvtx_csv))
+        owners = attribute_gaps(gaps, ranges)
+        print(f"GPU-idle gaps by innermost host NVTX range ({len(ranges)} ranges):")
+        print(f"{'range':<64}{'idle ms / run':>14}")
+        for name, total in sorted(owners.items(), key=lambda kv: kv[1], reverse=True)[:25]:
+            print(f"{name[:63]:<64}{ms(total):>14.3f}")
+        # Inclusive host time of the annotated stages (children included, so
+        # nested ranges are counted in their parents too).
+        inclusive: dict[str, int] = defaultdict(int)
+        counts: dict[str, int] = defaultdict(int)
+        for start, end, _, name in ranges:
+            inclusive[name] += end - start
+            counts[name] += 1
+        print()
+        print(f"{'NVTX range (inclusive host time)':<64}{'ms / run':>12}{'count / run':>14}")
+        for name, total in sorted(inclusive.items(), key=lambda kv: kv[1], reverse=True)[:30]:
+            print(f"{name[:63]:<64}{ms(total):>12.3f}{counts[name] / rep:>14.1f}")
+        print()
     for bucket in [b for b, _ in BUCKETS] + ["other"]:
         names = sorted(((v[0], v[1], n) for n, v in per_kernel.items() if bucket_of(n) == bucket),
                        reverse=True)[:args.top]

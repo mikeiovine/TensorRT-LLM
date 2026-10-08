@@ -97,6 +97,66 @@ def test_merge_prefix_and_tail_matches_dense_attention(tail_len, with_mask,
     torch.testing.assert_close(merged, expected, atol=1e-5, rtol=1e-4)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("tail_len", [0, 1, 2, 5])
+@pytest.mark.parametrize("group", [1, 2])
+def test_fused_tail_merge_matches_torch_path(tail_len, group):
+    """The Triton tail+merge kernel reproduces merge_prefix_and_tail, reading
+    the tail K/V straight from a paged pool through page/slot indices."""
+    from tensorrt_llm._torch.attention.kernels.beam_tail_merge import \
+        beam_tail_merge
+
+    torch.manual_seed(0)
+    device = "cuda"
+    rows, num_kv_heads, head_dim, page_size, pages = 10, 2, 128, 32, 7
+    num_heads = num_kv_heads * group
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    pool = torch.randn(pages, 2, num_kv_heads, page_size, head_dim,
+                       device=device, dtype=torch.bfloat16)
+    # Packed QKV row layout, like the attention input the library receives.
+    qkv = torch.randn(rows, (num_heads + 2 * num_kv_heads) * head_dim,
+                      device=device, dtype=torch.bfloat16)
+    q = qkv[:, :num_heads * head_dim].view(rows, num_heads, head_dim)
+    k = qkv[:, num_heads * head_dim:(num_heads + num_kv_heads) *
+            head_dim].view(rows, num_kv_heads, head_dim)
+    v = qkv[:, (num_heads + num_kv_heads) * head_dim:].view(
+        rows, num_kv_heads, head_dim)
+    prefix_out = torch.randn(rows, num_heads, head_dim, device=device,
+                             dtype=torch.bfloat16)
+    prefix_lse = torch.randn(rows, num_heads, device=device) * 3 + 10
+    prefix_empty = torch.zeros(rows, dtype=torch.bool, device=device)
+    prefix_empty[-1] = True
+    if tail_len > 0:
+        tail_page = torch.randint(0, pages, (rows, tail_len), device=device)
+        tail_slot = torch.randint(0, page_size, (rows, tail_len), device=device)
+        tail_valid = torch.rand(rows, tail_len, device=device) > 0.3
+        k_tail = pool[tail_page, 0, :, tail_slot, :]
+        v_tail = pool[tail_page, 1, :, tail_slot, :]
+        k_all = torch.cat([k_tail, k.unsqueeze(1)], dim=1)
+        v_all = torch.cat([v_tail, v.unsqueeze(1)], dim=1)
+        valid = torch.cat(
+            [tail_valid, torch.ones(rows, 1, dtype=torch.bool, device=device)],
+            dim=1)
+    else:
+        tail_page = tail_slot = tail_valid = None
+        k_all, v_all, valid = k.unsqueeze(1), v.unsqueeze(1), None
+    expected = merge_prefix_and_tail(q,
+                                     k_all,
+                                     v_all,
+                                     valid,
+                                     prefix_out,
+                                     prefix_lse,
+                                     num_kv_heads=num_kv_heads,
+                                     sm_scale=sm_scale,
+                                     prefix_empty=prefix_empty)
+    out = torch.empty(rows, num_heads, head_dim, device=device,
+                      dtype=torch.bfloat16)
+    beam_tail_merge(q, k, v, pool, tail_page, tail_slot, tail_valid,
+                    prefix_out, prefix_lse, prefix_empty, out,
+                    sm_scale=sm_scale)
+    torch.testing.assert_close(out.float(), expected, atol=3e-2, rtol=2e-2)
+
+
 def _qwen3_small_path():
     root = llm_models_root(check=False)
     if root is None:

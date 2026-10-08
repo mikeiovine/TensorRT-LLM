@@ -1613,9 +1613,16 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     # visible to streaming consumers and to anything reading
                     # get_tokens() mid-flight (e.g. the token-ban suffix
                     # matching) even though finalization later rewrites it.
-                    for beam_idx in range(_get_beam_width_out(req)):
-                        # Beam search does not support speculative decoding.
-                        add_token(req, new_tokens_list, beam_idx=beam_idx)
+                    beam_width_out = _get_beam_width_out(req)
+                    if beam_width_out == req.py_beam_width:
+                        # One binding call appends this step's token to every
+                        # beam; the C++ side requires exactly beam_width tokens.
+                        assert req.py_seq_slot is not None
+                        req.add_new_tokens(new_tokens_list[0][req.py_seq_slot][:beam_width_out])
+                    else:
+                        for beam_idx in range(beam_width_out):
+                            # Beam search does not support speculative decoding.
+                            add_token(req, new_tokens_list, beam_idx=beam_idx)
                     self._log_probs.handle_logprobs(
                         req, logprobs_state_list=logprobs_state_list, count=1
                     )
