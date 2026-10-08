@@ -2461,10 +2461,6 @@ def test_beam_search_sampler_cuda_graph_matches_eager(
     """
     beam_width = 8
     input_prompts = [[1, 2, 3], [4, 5, 6]]
-    checkpoint_loader = HfCheckpointLoader(
-        weight_loader=DummyWeightLoader(),
-        config_loader=DummyConfigLoader(),
-    )
     sampling_params = SamplingParams(
         max_tokens=6,
         n=beam_width,
@@ -2479,9 +2475,14 @@ def test_beam_search_sampler_cuda_graph_matches_eager(
                            "1" if graph_enabled else "0")
         gc.collect(2)
         with _single_process_context():
+            # LLM.shutdown resets the loader's config_loader, so each run
+            # needs its own checkpoint loader.
             llm = LLM(
                 model=_pl.Path("dummy_path"),
-                checkpoint_loader=checkpoint_loader,
+                checkpoint_loader=HfCheckpointLoader(
+                    weight_loader=DummyWeightLoader(),
+                    config_loader=DummyConfigLoader(),
+                ),
                 max_beam_width=beam_width,
                 max_batch_size=beam_width * len(input_prompts),
                 max_seq_len=64,
