@@ -689,7 +689,11 @@ def build_parser() -> argparse.ArgumentParser:
     # Engine knobs.
     off.add_argument("--max-num-tokens", type=int,
                      help="Default: max(batch) * max(context_len) so one prefill batch covers the case")
-    off.add_argument("--kv-cache-free-gpu-mem-fraction", type=float, default=0.85)
+    off.add_argument(
+        "--kv-cache-free-gpu-mem-fraction", type=float, default=0.6,
+        help="The sweep needs ~12 GB of KV cache at most (ctx 5000, batch 8, "
+        "beam 256); the rest of the GPU must hold the decode, prefill and "
+        "beam-sampler CUDA graphs, which are captured after KV sizing")
     off.add_argument("--disable-overlap-scheduler", action="store_true")
     off.add_argument("--no-cuda-graph", action="store_true")
     off.add_argument("--attn-backend", help="e.g. TRTLLM, FLASHINFER")
