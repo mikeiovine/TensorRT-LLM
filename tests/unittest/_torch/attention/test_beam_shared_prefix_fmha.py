@@ -161,8 +161,14 @@ def test_beam_shared_prefix_matches_fallback_e2e():
     base_env = {"TLLM_WORKER_USE_SINGLE_PROCESS": "1"}
     reference = _run_beam_search(model_path, prompts, beam_width, max_tokens,
                                  base_env)
-    candidate = _run_beam_search(model_path, prompts, beam_width, max_tokens,
-                                 base_env | {"TLLM_FMHA_LIBS": f"+{LIB_NAME}"})
+    # Check mode synchronizes after every stage and validates the page table
+    # and the prefix attention against dense references inside the library.
+    candidate = _run_beam_search(
+        model_path, prompts, beam_width, max_tokens, base_env | {
+            "TLLM_FMHA_LIBS": f"+{LIB_NAME}",
+            "TLLM_BEAM_SHARED_PREFIX_CHECK": "1",
+            "TLLM_BEAM_SHARED_PREFIX_MAX_TAIL": str(max_tokens - 1),
+        })
 
     for ref_beams, cand_beams in zip(reference, candidate):
         assert len(cand_beams) == beam_width

@@ -87,11 +87,30 @@ LIB_NAME = "beam_shared_prefix"
 
 MAX_TAIL_ENV = "TLLM_BEAM_SHARED_PREFIX_MAX_TAIL"
 DEFAULT_MAX_TAIL = 8
+BACKEND_ENV = "TLLM_BEAM_SHARED_PREFIX_BACKEND"
+"""FlashInfer prefill backend for the prefix call. Default ``fa2``, the kernel
+family the TRTLLM FlashInfer backend pins for paged prefill; ``fa3`` or
+``auto`` select the Hopper kernels."""
+DEFAULT_BACKEND = "fa2"
+CHECK_ENV = "TLLM_BEAM_SHARED_PREFIX_CHECK"
+"""Set to 1 to synchronize after every stage of the step and validate the
+page table and the prefix attention against dense references. Debugging aid:
+it serializes the GPU and must stay off for measurements."""
 
 _LOG2E = 1.4426950408889634
-# Split-KV partial results of the prefix call; sized for wide beams x heads.
-_FLOAT_WORKSPACE_BYTES = 32 * 1024 * 1024
+# Split-KV partial results of the prefix call. FlashInfer recommends 128 MB
+# and raises (rather than overflows) if a plan needs more.
+_FLOAT_WORKSPACE_BYTES = 128 * 1024 * 1024
 _float_workspace: Dict[torch.device, torch.Tensor] = {}
+
+
+def _check_enabled() -> bool:
+    return os.environ.get(CHECK_ENV, "0") == "1"
+
+
+def _backend_from_env() -> str:
+    value = os.environ.get(BACKEND_ENV, "").strip()
+    return value or DEFAULT_BACKEND
 
 
 def _get_float_workspace(device: torch.device) -> torch.Tensor:
@@ -173,6 +192,10 @@ class _StepIndices:
     """[rows, tail_len] int64."""
     tail_valid: Optional[torch.Tensor]
     """[rows, tail_len] bool: position exists (< current position)."""
+    prefix_empty: torch.Tensor
+    """[rows] bool: the row has no cached token before the current one (only
+    warmup/dummy rows). Its prefix call runs over a one-token placeholder and
+    is masked out of the merge."""
 
 
 @dataclass
@@ -190,6 +213,8 @@ class _BeamStepState:
     """Divisor turning a K entry of ``kv_cache_block_offsets`` into a pool page
     index: ``layers_in_pool * kv_factor`` for the standard pool layout."""
     max_tail: int
+    num_pages: int
+    """Pages in the primary pool; bounds every page index handed to a kernel."""
     plan: Optional[_HostPlan] = None
     wrappers: Dict[_PlanKey, Any] = field(default_factory=dict)
     planned_step: Dict[_PlanKey, int] = field(default_factory=dict)
@@ -266,11 +291,15 @@ def plan_step(metadata: "TrtllmAttentionMetadata") -> None:
         # The layer-independent layout facts come from layer 0's pool; a
         # layer of a different pool creates its own wrapper key below.
         pool_index, page_stride = _pool_layout(metadata, 0)
+        kv_cache_manager = metadata.kv_cache_manager
+        first_layer = min(kv_cache_manager.layer_offsets)
+        pool = kv_cache_manager.get_buffers(first_layer, kv_layout="HND")
         state = _BeamStepState(
             is_cuda_graph=metadata.is_cuda_graph,
             pool_index=pool_index,
             page_stride=page_stride,
             max_tail=_max_tail_from_env(),
+            num_pages=int(pool.size(0)),
         )
         metadata.fmha_plan_caches[LIB_NAME] = state
     state.step_counter += 1
@@ -290,6 +319,10 @@ def plan_step(metadata: "TrtllmAttentionMetadata") -> None:
     # Generated positions before the current token; uniform within a request.
     tail_lens = kv_lens - prompt_lens - 1
     max_tail = int(tail_lens.max().item()) if rows > 0 else 0
+    # A row with nothing cached before the current token (kv_len == 1) would
+    # give FlashInfer a zero-length KV segment. Plan a one-token placeholder
+    # instead; _step_indices flags the row and the merge drops its prefix.
+    prompt_lens = prompt_lens.clamp(min=1)
     if state.is_cuda_graph:
         if max_tail > state.max_tail:
             raise RuntimeError(
@@ -314,7 +347,9 @@ def plan_step(metadata: "TrtllmAttentionMetadata") -> None:
         n_blocks = int(ctx_blocks[request_idx])
         pages.append(offsets_k[row, :n_blocks].to(torch.int64) // state.page_stride)
     paged_kv_indices = (
-        torch.cat(pages).to(torch.int32) if pages else torch.zeros((0,), dtype=torch.int32)
+        torch.cat(pages).clamp(0, state.num_pages - 1).to(torch.int32)
+        if pages
+        else torch.zeros((0,), dtype=torch.int32)
     )
     paged_kv_indptr = torch.zeros((num_requests + 1,), dtype=torch.int32)
     paged_kv_indptr[1:] = torch.cumsum(ctx_blocks, dim=0).to(torch.int32)
@@ -381,7 +416,7 @@ def _create_wrapper(
             ),
         )
     return flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        _get_float_workspace(device), "HND", backend="auto", **kwargs
+        _get_float_workspace(device), "HND", backend=_backend_from_env(), **kwargs
     )
 
 
@@ -412,9 +447,10 @@ def _step_indices(
     prompt_len = metadata.prompt_lens_cuda_runtime[num_ctx : num_ctx + rows].to(torch.int64)
     row_ids = torch.arange(rows, device=device, dtype=torch.int64)
     cache_rows = row_ids + num_ctx
-    current = kv_len - 1
+    current = (kv_len - 1).clamp(min=0)
     # Same clamp as the host plan: the prefix never extends past the current token.
     prompt_len = torch.minimum(prompt_len, current)
+    prefix_empty = prompt_len < 1
     write_page = (offsets_k[cache_rows, (current // tokens_per_block).clamp(max=max_blocks - 1)]
                   // state.page_stride).clamp(0, num_pages - 1)
     write_slot = current % tokens_per_block
@@ -430,7 +466,7 @@ def _step_indices(
             plan.tail_len, device=device, dtype=torch.int64
         ).view(1, -1)
         tail_valid = positions < current.view(-1, 1)
-        positions = positions.clamp(max=max_positions - 1)
+        positions = positions.clamp(min=0, max=max_positions - 1)
         # The beam whose block holds this position, per the sampler's
         # indirection table (rows are the generation requests of the batch).
         src_beam = cache_indirection[request_ids.view(-1, 1), beam_ids.view(-1, 1), positions]
@@ -447,6 +483,7 @@ def _step_indices(
         tail_page=tail_page,
         tail_slot=tail_slot,
         tail_valid=tail_valid,
+        prefix_empty=prefix_empty,
     )
     return state.indices
 
@@ -461,6 +498,7 @@ def merge_prefix_and_tail(
     *,
     num_kv_heads: int,
     sm_scale: float,
+    prefix_empty: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Attend ``q`` to the tail K/V and merge with the prefix partial state.
 
@@ -474,12 +512,17 @@ def merge_prefix_and_tail(
             **in base 2**, FlashInfer's convention
             (``lse = log2(sum_j 2^(s_j * log2(e)))`` with ``s_j`` the scaled
             scores).
+        prefix_empty: [rows] bool, or None. Rows whose prefix state is a
+            placeholder and must not contribute.
 
     Returns:
         [rows, num_heads, head_dim] attention over prefix + tail, in fp32.
     """
     rows, num_heads, head_dim = q.shape
     group = num_heads // num_kv_heads
+    if prefix_empty is not None:
+        prefix_lse = prefix_lse.masked_fill(prefix_empty.view(rows, 1), float("-inf"))
+        prefix_out = prefix_out.masked_fill(prefix_empty.view(rows, 1, 1), 0.0)
     q_grouped = q.view(rows, num_kv_heads, group, head_dim).float()
     # Scores in the log2 domain so they combine directly with the prefix LSE.
     scores = torch.einsum("rkgd,rtkd->rkgt", q_grouped, k_tail.float()) * (sm_scale * _LOG2E)
@@ -643,15 +686,30 @@ class BeamSharedPrefixFmha(PhasedFmha):
         v = qkv[:, q_size + kv_size : q_size + 2 * kv_size].view(rows, num_kv_heads, head_dim)
 
         pool = self._pool_view(metadata)
+        check = _check_enabled()
+        if check:
+            _sync_checkpoint(f"layer {attn.layer_idx}: before step (error from an earlier op)")
+            _check_plan(state, metadata, pool)
         indices = _step_indices(state, metadata, pool.size(0))
+        if check:
+            _sync_checkpoint(f"layer {attn.layer_idx}: step indices")
+            _check_indices(indices, pool, int(metadata.tokens_per_block))
 
         # 1. Persist the current token's K/V in the beam's own block.
         pool[indices.write_page, 0, :, indices.write_slot, :] = k
         pool[indices.write_page, 1, :, indices.write_slot, :] = v
+        if check:
+            _sync_checkpoint(f"layer {attn.layer_idx}: KV write")
 
         # 2. Shared prefix: all beams of a request against the prompt KV.
         q_contig = q.contiguous()
         prefix_out, prefix_lse = wrapper.run(q_contig, pool, return_lse=True)
+        if check:
+            _sync_checkpoint(f"layer {attn.layer_idx}: FlashInfer prefix attention")
+            _check_prefix_against_reference(
+                state, metadata, pool, q_contig, prefix_out, prefix_lse, indices,
+                num_kv_heads=num_kv_heads, sm_scale=sm_scale, layer_idx=attn.layer_idx,
+            )
 
         # 3. Tail: past generated positions via indirection, plus the current token.
         if plan.tail_len > 0:
@@ -669,6 +727,8 @@ class BeamSharedPrefixFmha(PhasedFmha):
             k_all = k.unsqueeze(1)
             v_all = v.unsqueeze(1)
             valid = None
+        if check:
+            _sync_checkpoint(f"layer {attn.layer_idx}: tail gather")
 
         # 4. Tail attention and log-sum-exp merge of the two partial states.
         merged = merge_prefix_and_tail(
@@ -680,12 +740,146 @@ class BeamSharedPrefixFmha(PhasedFmha):
             prefix_lse,
             num_kv_heads=num_kv_heads,
             sm_scale=sm_scale,
+            prefix_empty=indices.prefix_empty,
         )
+        if check:
+            _sync_checkpoint(f"layer {attn.layer_idx}: tail + merge")
+            if not torch.isfinite(merged).all():
+                raise RuntimeError(
+                    f"{LIB_NAME} check: non-finite attention output at layer {attn.layer_idx}"
+                )
 
         output = params.output
         if output is None:
             raise RuntimeError(f"{type(self).__name__} requires an output tensor.")
         output.view(rows, num_heads, head_dim).copy_(merged.to(output.dtype))
+
+
+# --------------------------------------------------------------------------- #
+# Check mode (TLLM_BEAM_SHARED_PREFIX_CHECK=1)
+# --------------------------------------------------------------------------- #
+def _sync_checkpoint(what: str) -> None:
+    """Surface asynchronous CUDA errors at the stage that caused them."""
+    try:
+        torch.cuda.synchronize()
+    except RuntimeError as exc:
+        raise RuntimeError(f"{LIB_NAME} check: CUDA error surfaced at [{what}]: {exc}") from exc
+
+
+def _check_plan(state: _BeamStepState, metadata: "TrtllmAttentionMetadata",
+                pool: torch.Tensor) -> None:
+    """Validate the host plan: page ids in range and equal to the manager's
+    block table for beam 0 of every request."""
+    plan = state.plan
+    assert plan is not None
+    num_pages = pool.size(0)
+    indices = plan.paged_kv_indices.to(torch.int64)
+    if indices.numel() and (indices.min() < 0 or indices.max() >= num_pages):
+        raise RuntimeError(
+            f"{LIB_NAME} check: prefix page ids out of range [0, {num_pages}): "
+            f"min {int(indices.min())} max {int(indices.max())} (page stride {state.page_stride})"
+        )
+    request_ids = metadata.request_ids
+    if request_ids is None:
+        return
+    gen_request_ids = list(request_ids[metadata.num_contexts:])
+    if len(gen_request_ids) != plan.num_requests:
+        raise RuntimeError(
+            f"{LIB_NAME} check: {len(gen_request_ids)} generation request ids vs "
+            f"{plan.num_requests} planned requests"
+        )
+    try:
+        block_ids = metadata.kv_cache_manager.get_batch_cache_indices(gen_request_ids)
+    except Exception as exc:  # noqa: BLE001 - diagnostics only
+        logger.warning(f"{LIB_NAME} check: could not read the manager block table: {exc!r}")
+        return
+    indptr = plan.paged_kv_indptr.tolist()
+    for request_idx, blocks in enumerate(block_ids):
+        planned = indices[indptr[request_idx]:indptr[request_idx + 1]].tolist()
+        expected = [int(b) for b in blocks[: len(planned)]]
+        if planned != expected:
+            raise RuntimeError(
+                f"{LIB_NAME} check: prefix page table of request {request_idx} differs from "
+                f"the KV manager's beam-0 block ids.\n planned : {planned[:12]}...\n"
+                f" manager: {expected[:12]}... (page stride {state.page_stride})"
+            )
+    logger.info(f"{LIB_NAME} check: prefix page table matches the KV manager "
+                f"({plan.num_requests} requests, {int(indices.numel())} pages)")
+
+
+def _check_indices(indices: _StepIndices, pool: torch.Tensor, tokens_per_block: int) -> None:
+    num_pages = pool.size(0)
+    for name, tensor, bound in (
+        ("write_page", indices.write_page, num_pages),
+        ("write_slot", indices.write_slot, tokens_per_block),
+        ("tail_page", indices.tail_page, num_pages),
+        ("tail_slot", indices.tail_slot, tokens_per_block),
+    ):
+        if tensor is None or tensor.numel() == 0:
+            continue
+        lo, hi = int(tensor.min()), int(tensor.max())
+        if lo < 0 or hi >= bound:
+            raise RuntimeError(
+                f"{LIB_NAME} check: {name} out of range [0, {bound}): min {lo} max {hi}"
+            )
+
+
+def _check_prefix_against_reference(
+    state: _BeamStepState,
+    metadata: "TrtllmAttentionMetadata",
+    pool: torch.Tensor,
+    q: torch.Tensor,
+    prefix_out: torch.Tensor,
+    prefix_lse: torch.Tensor,
+    indices: _StepIndices,
+    *,
+    num_kv_heads: int,
+    sm_scale: float,
+    layer_idx: int,
+) -> None:
+    """Dense recomputation of the prefix attention from the planned pages."""
+    plan = state.plan
+    assert plan is not None
+    rows, num_heads, head_dim = q.shape
+    group = num_heads // num_kv_heads
+    tokens_per_block = int(metadata.tokens_per_block)
+    indptr = plan.paged_kv_indptr.tolist()
+    last_page_len = plan.paged_kv_last_page_len.tolist()
+    pages_all = plan.paged_kv_indices.to(torch.int64)
+    worst_out = 0.0
+    worst_lse = 0.0
+    for request_idx in range(plan.num_requests):
+        pages = pages_all[indptr[request_idx]:indptr[request_idx + 1]].to(pool.device)
+        n_pages = pages.numel()
+        if n_pages == 0:
+            continue
+        prefix_len = (n_pages - 1) * tokens_per_block + int(last_page_len[request_idx])
+        # [pages, 2, Hkv, tpb, D] -> [L, Hkv, D]
+        kv = pool[pages].permute(0, 3, 1, 2, 4).reshape(n_pages * tokens_per_block, 2,
+                                                       num_kv_heads, head_dim)[:prefix_len]
+        k_ref = kv[:, 0].float()
+        v_ref = kv[:, 1].float()
+        row0 = request_idx * plan.beam_width
+        row1 = row0 + plan.beam_width
+        q_req = q[row0:row1].float().view(plan.beam_width, num_kv_heads, group, head_dim)
+        scores = torch.einsum("rkgd,tkd->rkgt", q_req, k_ref) * sm_scale
+        ref_out = torch.einsum("rkgt,tkd->rkgd", torch.softmax(scores, dim=-1), v_ref)
+        ref_lse = torch.logsumexp(scores, dim=-1) * _LOG2E
+        got_out = prefix_out[row0:row1].float().view(plan.beam_width, num_kv_heads, group,
+                                                     head_dim)
+        got_lse = prefix_lse[row0:row1].view(plan.beam_width, num_kv_heads, group)
+        keep = ~indices.prefix_empty[row0:row1].view(-1, 1, 1)
+        worst_out = max(worst_out, float(((ref_out - got_out).abs() * keep.unsqueeze(-1)).max()))
+        worst_lse = max(worst_lse, float(((ref_lse - got_lse).abs() * keep).max()))
+    tol_out, tol_lse = 2e-2, 2e-2
+    if worst_out > tol_out or worst_lse > tol_lse:
+        raise RuntimeError(
+            f"{LIB_NAME} check: FlashInfer prefix attention disagrees with the dense reference "
+            f"at layer {layer_idx}: max |out| diff {worst_out:.4f}, max |lse2| diff "
+            f"{worst_lse:.4f} (backend {_backend_from_env()})"
+        )
+    logger.info(f"{LIB_NAME} check: layer {layer_idx} prefix attention matches the dense "
+                f"reference (max |out| diff {worst_out:.2e}, max |lse2| diff {worst_lse:.2e})")
 
 
 __all__ = [

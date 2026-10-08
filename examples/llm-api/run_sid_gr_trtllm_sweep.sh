@@ -19,6 +19,10 @@
 #
 # Knobs: MODEL, CONTEXT_LENS, BEAM_WIDTHS, BATCH_SIZES, OUTPUT_LEN, WARMUP_RUNS, REPEAT,
 #        OUT_ROOT, EXTRA_ARGS (appended to every run, e.g. "--no-perf-metrics").
+# Debugging the flashinfer variant: CHECK=1 runs it with
+# TLLM_BEAM_SHARED_PREFIX_CHECK=1 CUDA_LAUNCH_BLOCKING=1 (synchronizes after every stage
+# and validates the page table / prefix attention; numbers from that run are not timings).
+# FLASHINFER_BACKEND=fa2|fa3|auto selects the FlashInfer prefill kernels (default fa2).
 
 set -euo pipefail
 
@@ -76,6 +80,12 @@ for variant in ${VARIANTS}; do
     flashinfer)
       args+=(--cascade-mmha --fmha-libs "+beam_shared_prefix" --beam-max-tail "${max_tail}")
       [[ "${SINGLE_PROCESS}" == "1" ]] && args+=(--single-process)
+      if [[ -n "${FLASHINFER_BACKEND:-}" ]]; then
+        args+=(--env "TLLM_BEAM_SHARED_PREFIX_BACKEND=${FLASHINFER_BACKEND}")
+      fi
+      if [[ "${CHECK:-0}" == "1" ]]; then
+        args+=(--env TLLM_BEAM_SHARED_PREFIX_CHECK=1 --env CUDA_LAUNCH_BLOCKING=1 --warmup-runs 1 --repeat 1)
+      fi
       ;;
     *)
       echo "unknown variant ${variant}" >&2
