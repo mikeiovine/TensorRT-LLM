@@ -646,6 +646,7 @@ def make_kv_cache_manager(
     mgr.resize_context.side_effect = resize_context_fn or (lambda req, n: True)
     mgr.try_allocate_draft_context.side_effect = lambda req, n: True
     mgr.prepare_disagg_gen_init.side_effect = prepare_disagg_gen_init_fn or (lambda req: True)
+    mgr.prepare_disagg_draft_gen_init.side_effect = lambda req: True
     mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
     # An unpaired draft pool is created-and-resumed through this during
     # admission; a real manager answers False when either step fails.
@@ -3077,6 +3078,40 @@ class TestDisagg:
         reqs = [make_disagg_request(0, lora_task_id=42), make_disagg_request(1, lora_task_id=42)]
         out = sched.schedule_request(reqs, set())
         assert ids(out.fitting_disagg_gen_init_requests) == [0, 1]
+
+    def test_disagg_admits_the_draft_mirror_before_the_target(self):
+        """A separate draft pool receives its prompt context too. It is admitted
+        first, so the readiness event the target records covers both pools."""
+        order = []
+        mgr = make_kv_cache_manager(
+            prepare_disagg_gen_init_fn=lambda req: order.append("target") or True
+        )
+        draft_mgr = make_kv_cache_manager()
+        draft_mgr.prepare_disagg_draft_gen_init.side_effect = (
+            lambda req: order.append("draft") or True
+        )
+        sched = make_scheduler(mgr, max_num_tokens=100, draft_kv_cache_manager=draft_mgr)
+        out = sched.schedule_request([make_disagg_request(0)], set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [0]
+        assert order == ["draft", "target"]
+
+    def test_disagg_draft_refusal_skips_without_touching_the_target(self):
+        mgr = make_kv_cache_manager()
+        draft_mgr = make_kv_cache_manager()
+        draft_mgr.prepare_disagg_draft_gen_init.side_effect = lambda req: False
+        sched = make_scheduler(mgr, max_num_tokens=100, draft_kv_cache_manager=draft_mgr)
+        out = sched.schedule_request([make_disagg_request(0)], set())
+        assert ids(out.fitting_disagg_gen_init_requests) == []
+        mgr.prepare_disagg_gen_init.assert_not_called()
+
+    def test_disagg_target_refusal_suspends_the_draft_mirror(self):
+        mgr = make_kv_cache_manager(prepare_disagg_gen_init_fn=lambda req: False)
+        draft_mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=100, draft_kv_cache_manager=draft_mgr)
+        req = make_disagg_request(0)
+        out = sched.schedule_request([req], set())
+        assert ids(out.fitting_disagg_gen_init_requests) == []
+        draft_mgr.suspend_request.assert_called_once_with(req)
 
     def test_disagg_prepare_disagg_gen_init_fails_skips(self):
         """prepare_disagg_gen_init failure skips the request, loop continues."""

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from collections import defaultdict
+from dataclasses import replace
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -796,3 +797,45 @@ def build_page_table_from_manager(manager) -> KVCachePageTable:
         return _build_page_table_v2(manager)
     else:
         return build_page_table(manager)
+
+
+# A separate draft pool's layers are numbered from here in a transfer page
+# table, past every target layer id (synthetic virtual-layer ids included), so
+# peers pair draft layers with each other and never with target layers.
+DRAFT_GLOBAL_LAYER_ID_BASE = 1 << 24
+
+
+def is_draft_layer_group(layer_group: LayerGroup) -> bool:
+    """Whether a transfer page-table layer group describes a separate draft pool."""
+    return any(ll.global_layer_id >= DRAFT_GLOBAL_LAYER_ID_BASE for ll in layer_group.local_layers)
+
+
+def append_draft_page_table(
+    page_table: KVCachePageTable, draft_page_table: KVCachePageTable
+) -> KVCachePageTable:
+    """One transfer page table holding the target's layer groups, then the draft pool's.
+
+    Draft groups keep their order, so group ``len(page_table.layer_groups) + i``
+    is the draft manager's group ``i``. ``tokens_per_block`` stays the target's;
+    a draft group's block size comes from the draft manager.
+    """
+    pool_group_offset = len(page_table.pool_groups)
+    draft_layer_groups = [
+        replace(
+            layer_group,
+            pool_group_idx=layer_group.pool_group_idx + pool_group_offset,
+            local_layers=[
+                LocalLayer(
+                    local_layer_id=ll.local_layer_id,
+                    global_layer_id=ll.global_layer_id + DRAFT_GLOBAL_LAYER_ID_BASE,
+                )
+                for ll in layer_group.local_layers
+            ],
+        )
+        for layer_group in draft_page_table.layer_groups
+    ]
+    return KVCachePageTable(
+        tokens_per_block=page_table.tokens_per_block,
+        layer_groups=page_table.layer_groups + draft_layer_groups,
+        pool_groups=page_table.pool_groups + draft_page_table.pool_groups,
+    )

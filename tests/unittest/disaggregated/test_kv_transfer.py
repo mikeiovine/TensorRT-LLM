@@ -278,6 +278,7 @@ def _send_prefill_chunks(
     transceiver._get_or_create_send_session.return_value = session
     transceiver._describe_local = MagicMock(return_value=whole)
     transceiver._reuse_adapter.tokens_per_block = tokens_per_block
+    transceiver._draft_reuse_adapter = None
     transceiver._kv_cache_manager.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.kv_cache_map = {}
     transceiver._page_table.layer_groups = [
@@ -342,6 +343,7 @@ def test_build_prefill_chunk_slices_chunk_window_from_whole_prompt():
 
     transceiver = MagicMock()
     transceiver._reuse_adapter.tokens_per_block = tokens_per_block
+    transceiver._draft_reuse_adapter = None
     transceiver._kv_cache_manager.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.kv_cache_map = {}
     transceiver._page_table.layer_groups = [SimpleNamespace(sliding_window_size=None)]

@@ -18,9 +18,10 @@ Dummy rows add their accepted tokens to the dummy slot's length like any request
 maps past the padding request's own pages to page 0, which another request owns. A dummy length that kept growing
 would put the padding rows' context K / V on that page. The drafting step's ``DFlashWorker._advance_ctx_len`` empties
 the slot right after the add, inside the captured step, so ``DFlashSpecMetadata.prepare`` writes slot lengths only for
-evicted requests.
+evicted requests and for generation requests it has not seen before (a disaggregated generation worker's).
 """
 
+from collections import deque
 from functools import partial
 from types import SimpleNamespace
 
@@ -117,3 +118,31 @@ def test_prepare_resets_only_evicted_slots():
     assert written == [{}, {1: 0}]
     assert worker._ctx_len.tolist() == [40, 0, 7, 0, 96]
     assert 1 in worker._free_slots and 12 not in worker._req_to_slot
+
+
+@pytest.mark.parametrize(
+    "bound_to_pool,sent,expected",
+    [
+        pytest.param(True, 123, 123, id="received"),
+        pytest.param(True, None, 0, id="nothing-sent"),
+        pytest.param(False, 123, 0, id="private-arena"),
+        pytest.param(True, 1001, 0, id="past-max-ctx"),
+    ],
+)
+def test_disagg_generation_request_starts_at_its_received_prompt(bound_to_pool, sent, expected):
+    """A generation request first seen on a disagg generation worker gets a slot as long as the
+    drafter context its context worker sent into the draft pool, and is the only slot written."""
+    worker = _worker([40, 300, 7, 55, 0])
+    worker._free_slots = deque([3])
+    worker._assign_slot = partial(DFlashWorker._assign_slot, worker)
+    worker._received_prompt_len = partial(DFlashWorker._received_prompt_len, worker)
+    worker._ctx_block_tables = object() if bound_to_pool else None
+    prompt_lens = {14: sent} if sent is not None else {}
+    worker._ctx_kv_manager = SimpleNamespace(
+        take_disagg_prompt_len=lambda rid: prompt_lens.pop(rid, None)
+    )
+    _prepare(worker, [11, 12, 13, 14, FLOOR + 1], num_generations=5)
+    assert worker._req_to_slot[14] == 3
+    assert worker._batch_to_slot[:5].tolist() == [0, 1, 2, 3, 4]
+    assert worker._ctx_len.tolist() == [40, 300, 7, expected, 0]
+    assert worker._ctx_len_host == [40, 300, 7, expected, 0]

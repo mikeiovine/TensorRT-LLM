@@ -3400,6 +3400,7 @@ class Receiver(ReceiverBase):
                     self._registrar.self_extractor.page_table,
                     sender_info.page_table,
                 )
+                self._registrar.validate_draft_compatible(sender_info, receiving=True)
             except ValueError as e:
                 msg = (
                     f"context peer at '{info_endpoint}' is incompatible: {e} "
@@ -4513,6 +4514,9 @@ class TransferWorkerConfig:
     # trailing _BYTES, lowercased); dict > env > default. Ignored when
     # agent_buffer_size_mb == 0.
     agent_bounce_params: Optional[Dict[str, str]] = None
+    # A separate one-model draft pool whose blocks travel with the target's, as
+    # extra layer groups of the same page table.
+    draft_kv_cache_manager: Optional[KVCacheManager] = None
 
 
 class TransferWorker:
@@ -4537,6 +4541,7 @@ class TransferWorker:
             kvm,
             config.device_id,
             self._aux_buffer.meta if self._aux_buffer is not None else None,
+            draft_kv_cache_manager=config.draft_kv_cache_manager,
         )
         self._setup_peer_infrastructure(kvm)
         self._setup_transfer_engine()
@@ -4600,7 +4605,7 @@ class TransferWorker:
 
     def _setup_peer_infrastructure(self, kvm: KVCacheManager):
         self._rank_info_server = RankInfoServer(self._rank_info) if kvm.mapping.rank == 0 else None
-        self._kv_extractor = KVRegionExtractorV1(kvm)
+        self._kv_extractor = KVRegionExtractorV1(self._rank_info.page_table)
         self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor)
 
     def _setup_transfer_engine(self):

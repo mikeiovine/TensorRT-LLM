@@ -593,18 +593,19 @@ class DFlashSpecMetadata(SpecMetadata):
         worker = getattr(self, "_dflash_worker", None)
         if worker is not None and worker._ctx_buf_inited:
             current = set(self.request_ids)
-            evicted = {}
+            ctx_len_updates = {}
             for rid in list(worker._req_to_slot.keys()):
                 if rid not in current:
                     slot = worker._req_to_slot.pop(rid)
-                    evicted[slot] = 0
+                    ctx_len_updates[slot] = 0
                     worker._req_ctx_pos.pop(rid, None)
                     worker._free_slots.append(slot)
-            worker._write_ctx_len(evicted)
 
             # A disagg generation worker receives prompt KV instead of
             # prefilling, so _store_prefill_context -- the only other assigner --
-            # never runs and every request would land on the dummy slot.
+            # never runs and every request would land on the dummy slot. The
+            # drafter context the context worker sent is already in the slot's
+            # pages, so the slot starts that long.
             num_contexts = max(0, len(self.request_ids) - self.num_generations)
             for rid in self.request_ids[num_contexts:]:
                 if (
@@ -612,13 +613,17 @@ class DFlashSpecMetadata(SpecMetadata):
                     and rid < worker._graph_dummy_id_floor
                     and rid not in worker._req_to_slot
                 ):
-                    if worker._assign_slot(rid) is None:
+                    slot = worker._assign_slot(rid, updates=ctx_len_updates)
+                    if slot is None:
                         # Not fatal -- spec dec is lossless, so the dummy-slot
                         # fallback only costs acceptance. Warn so it is not silent.
                         logger.warning(
                             f"DFlash: no free drafter slot for generation request {rid}; "
                             "it shares the dummy slot and will draft poorly."
                         )
+                    else:
+                        ctx_len_updates[slot] = worker._received_prompt_len(rid)
+            worker._write_ctx_len(ctx_len_updates)
 
             # Route unknown request IDs (cuda graph padding or warmup dummies)
             # to dummy slot to avoid corrupting real request's context
@@ -1311,6 +1316,21 @@ class DFlashWorker(SpecWorkerBase):
             self._req_to_slot[req_id] = slot
             clear(slot)
         return self._req_to_slot[req_id]
+
+    def _received_prompt_len(self, req_id: int) -> int:
+        """Prompt positions of drafter context a disagg context worker sent for ``req_id``.
+
+        Only the draft KV cache manager's pool is transferred, so a private
+        arena received nothing; nor did a prompt past ``_max_ctx``, which the
+        context worker skipped storing (see _store_prefill_context).
+        """
+        if self._ctx_block_tables is None:
+            return 0
+        take = getattr(self._ctx_kv_manager, "take_disagg_prompt_len", None)
+        prompt_len = take(req_id) if take is not None else None
+        if prompt_len is None or prompt_len > self._max_ctx:
+            return 0
+        return prompt_len
 
     def _get_ctx_paged_append(self) -> Callable[..., None]:
         """flashinfer paged append, shared by the TRTLLM and FA4 backends."""

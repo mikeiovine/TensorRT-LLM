@@ -56,6 +56,7 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     create_cache_reuse_adapter,
 )
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import is_draft_layer_group
 from tensorrt_llm._torch.disaggregation.resource.utils import get_pool_view_slot_bytes
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor import hang_detector
@@ -232,6 +233,9 @@ def _validate_fp4_mla_bridge_profile(
 
 
 class KvCacheTransceiverV2(KvCacheTransceiver):
+    # Set in __init__ when a separate draft pool transfers with the target's.
+    _draft_reuse_adapter: Optional[CacheReuseAdapter] = None
+
     @property
     def consumes_transfer_buffer(self) -> bool:
         return False
@@ -242,12 +246,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         dist: Distributed,
         kv_cache_manager: KVCacheManager,
         cache_transceiver_config: CacheTransceiverConfig,
+        draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
     ):
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
         self._dist: Distributed = dist
         self._kv_cache_manager = kv_cache_manager
         self._mapping = mapping
+        if draft_kv_cache_manager is not None and (mapping.pp_size > 1 or mapping.cp_size > 1):
+            raise ValueError(
+                "Disaggregated transfer of a separate draft KV cache supports "
+                f"pp_size == 1 and cp_size == 1 only (got pp_size={mapping.pp_size}, "
+                f"cp_size={mapping.cp_size})."
+            )
+        if draft_kv_cache_manager is not None:
+            self._draft_reuse_adapter = create_cache_reuse_adapter(draft_kv_cache_manager)
         self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
         if self.kv_transfer_timeout_ms is None:
             raise ValueError("KvCacheTransceiverV2 requires a finite kv_transfer_timeout_ms")
@@ -318,6 +331,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     else 0
                 ),
                 agent_bounce_params=cache_transceiver_config.agent_bounce_params,
+                draft_kv_cache_manager=draft_kv_cache_manager,
             )
         )
         if enforce_physical_ownership:
@@ -346,6 +360,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_reqs = {}
         self._wait_reqs = {}
         self._page_table = self._transfer_worker.page_table
+        self._num_target_layer_groups = sum(
+            not is_draft_layer_group(lg) for lg in self._page_table.layer_groups
+        )
         try:
             self._enable_pipelined_transfer = self._resolve_pipelined_transfer(
                 cache_transceiver_config
@@ -520,6 +537,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         assert rid is not None
         return CacheExtent(name=rid, local=self._describe_local(req))
 
+    def _layer_group_owner(self, layer_group_id: int) -> tuple[CacheReuseAdapter, int]:
+        """The reuse adapter of the manager holding a page-table layer group, and the group's
+        id in that manager."""
+        if self._draft_reuse_adapter is None or layer_group_id < self._num_target_layer_groups:
+            return self._reuse_adapter, layer_group_id
+        return self._draft_reuse_adapter, layer_group_id - self._num_target_layer_groups
+
     def _describe_local(self, req: LlmRequest) -> Chunk:
         """The blocks this rank holds, one list per layer group.
 
@@ -531,15 +555,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         speculative tail and the ctx first-token block (num_extra_kv_tokens slots are not
         transferred; both sides use prompt_len, so the ranges stay consistent). On the receiver
         the already-cached prefix is masked so the sender skips it. A STATE group carries one
-        slot, or nothing when this rank has none.
+        slot, or nothing when this rank has none. A separate draft pool's groups come last and
+        are read from the draft manager, in its own tokens_per_block.
         """
         adapter = self._reuse_adapter
-        tpb = adapter.tokens_per_block
         assert self._page_table is not None
         layer_groups = self._page_table.layer_groups
         remote_tail_start = getattr(req, "py_csa2_remote_tail_start", None)
         transfer_len = remote_tail_start if remote_tail_start is not None else req.prompt_len
-        prompt_blocks = (transfer_len + tpb - 1) // tpb
         remote_tail_split = getattr(req, "py_csa2_remote_tail_split", None)
         excluded_pool_views = set()
         if remote_tail_split is not None:
@@ -549,11 +572,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             excluded_pool_views = exclude(self._page_table, remote_tail_split)
 
         is_gen_only = req.is_generation_only_request
-        cached_per_lg = (
-            adapter.get_cached_token_count_per_layer_group(req, layer_groups)
-            if is_gen_only
-            else [0] * len(layer_groups)
-        )
+        if not is_gen_only:
+            cached_per_lg = [0] * len(layer_groups)
+        elif self._draft_reuse_adapter is None:
+            cached_per_lg = adapter.get_cached_token_count_per_layer_group(req, layer_groups)
+        else:
+            num_target = self._num_target_layer_groups
+            cached_per_lg = adapter.get_cached_token_count_per_layer_group(
+                req, layer_groups[:num_target]
+            ) + self._draft_reuse_adapter.get_cached_token_count_per_layer_group(
+                req, layer_groups[num_target:]
+            )
 
         empty = np.array([], dtype=np.int64)
         groups = []
@@ -563,11 +592,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 slot = self._get_mamba_slot_for_request(req)
                 group = np.array([slot], dtype=np.int64) if slot is not None else empty
             else:
+                owner, owner_group_id = self._layer_group_owner(idx)
+                tpb = owner.tokens_per_block
                 # Block lists carry beam 0 only (beam-search attention reads
                 # prompt positions through beam 0's block table), so the
                 # positional path applies to every beam width.
-                ordinals = adapter.get_block_ordinals(req, idx, lg)
-                group = self._positional_window(ordinals, prompt_blocks, cached_per_lg[idx] // tpb)
+                ordinals = owner.get_block_ordinals(req, owner_group_id, lg)
+                group = self._positional_window(
+                    ordinals, (transfer_len + tpb - 1) // tpb, cached_per_lg[idx] // tpb
+                )
             groups.append(group)
 
         return Chunk(
@@ -1026,11 +1059,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if chunk_end <= chunk_start and not is_last_chunk:
             return None
 
+        # The block window is rounded up; the span this piece delivers is not. Every reader below
+        # rounds back to blocks, and a recurrent-state group reads the end as an exact checkpoint.
+        chunk_end_token = min(chunk_end * tpb, req.prompt_len) if is_last_chunk else chunk_end * tpb
         whole = self._describe_local(req)
         all_block_ids = whole.block_ids_per_layer_groups
         chunk_block_ids = []
         assert self._page_table is not None
-        for lg, block_ids in zip(self._page_table.layer_groups, all_block_ids):
+        for idx, (lg, block_ids) in enumerate(zip(self._page_table.layer_groups, all_block_ids)):
             window_size = getattr(lg, "sliding_window_size", None)
             if window_size is not None and window_size < req.prompt_len:
                 # SWA pages can leave the active window between chunks. Defer
@@ -1038,14 +1074,23 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 chunk_block_ids.append(block_ids if is_last_chunk else np.full_like(block_ids, -1))
             else:
                 # Positional: keep the chunk's ordinals, blank everything else.
+                start, end = chunk_start, chunk_end
+                if self._draft_reuse_adapter is not None and idx >= self._num_target_layer_groups:
+                    # A draft pool's own blocks over the same token span. Both
+                    # bounds round down, so a block straddling the span's end
+                    # goes with the next chunk.
+                    draft_tpb = self._draft_reuse_adapter.tokens_per_block
+                    start = chunk_start * tpb // draft_tpb
+                    end = (
+                        (chunk_end_token + draft_tpb - 1) // draft_tpb
+                        if is_last_chunk
+                        else chunk_end_token // draft_tpb
+                    )
                 chunk = np.full_like(block_ids, -1)
-                chunk[chunk_start:chunk_end] = block_ids[chunk_start:chunk_end]
+                chunk[start:end] = block_ids[start:end]
                 chunk_block_ids.append(chunk)
         if not is_last_chunk and not any((ids >= 0).any() for ids in chunk_block_ids):
             return None
-        # The block window is rounded up; the span this piece delivers is not. Every reader below
-        # rounds back to blocks, and a recurrent-state group reads the end as an exact checkpoint.
-        chunk_end_token = min(chunk_end * tpb, req.prompt_len) if is_last_chunk else chunk_end * tpb
         return CacheExtent(
             name=rid,
             local=Chunk(

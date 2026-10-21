@@ -25,7 +25,10 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxTransferLayou
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
+    KVRegionExtractorV1,
+    is_draft_layer_group,
+)
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, MapperKind, PoolView
 from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_layer_byte_ranges,
@@ -35,6 +38,17 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
 
 # Type alias for (lg_idx, pool_idx) pair
 LGPoolKey = Tuple[int, int]
+
+
+def _draft_heads_per_rank(rank_info: RankInfo) -> set[int]:
+    """KV heads per rank of the separate draft pool a rank advertises; empty without one."""
+    if rank_info.page_table is None:
+        return set()
+    return {
+        lg.kv_head_num_per_rank
+        for lg in rank_info.page_table.layer_groups
+        if lg.kind == CacheKind.PAGED and is_draft_layer_group(lg)
+    }
 
 
 @dataclass
@@ -162,6 +176,37 @@ class PeerRegistrar:
                 f"peer={peer_ri.bounded_replay_on_generation})."
             )
 
+    def validate_draft_compatible(self, peer_ri: RankInfo, receiving: bool = False) -> None:
+        """Reject a peer this rank's separate draft KV pool cannot be exchanged with.
+
+        A head-mismatched transfer slices every attention view by the target's
+        per-rank head count, which fits a draft pool only when it holds as many
+        heads per rank as the target. ``receiving`` marks a peer this rank
+        receives a prompt from: if it has no draft pool, this rank's would be
+        left holding pages nothing wrote. Raises ``ValueError``.
+        """
+        self_heads = _draft_heads_per_rank(self._ri)
+        peer_heads = _draft_heads_per_rank(peer_ri)
+        if receiving and self_heads and not peer_heads:
+            raise ValueError(
+                "PeerRegistrar: this worker receives a separate draft KV pool, but context "
+                f"peer {peer_ri.instance_name} sends none. Configure the same speculative "
+                "decoding on the context and generation workers."
+            )
+        if not (self_heads and peer_heads):
+            return
+        if self._get_policy(CacheKind.PAGED).head_match(peer_ri)[0]:
+            return
+        for ri, heads in ((self._ri, self_heads), (peer_ri, peer_heads)):
+            if heads != {ri.attention.kv_heads_per_rank}:
+                raise ValueError(
+                    "PeerRegistrar: draft KV transfer between peers with different attention "
+                    f"layouts needs the draft pool on {ri.instance_name} rank {ri.instance_rank} "
+                    "to hold as many KV heads per rank as the target "
+                    f"({ri.attention.kv_heads_per_rank}); it holds {sorted(heads)}. Use the "
+                    "same attention TP/DP layout on the context and generation workers."
+                )
+
     def _check_peer_compatible(self, peer_ri: RankInfo) -> bool:
         self.validate_bounded_replay_compatible(peer_ri)
         if not self._get_policy(CacheKind.PAGED).check_peer_compatible(peer_ri):
@@ -180,6 +225,7 @@ class PeerRegistrar:
             peer_ri.page_table,
         )
         AttentionPolicy.validate_peer_compatible(self_page_table, peer_ri.page_table)
+        self.validate_draft_compatible(peer_ri)
 
         self_layers = sum(self._ri.layer_num_per_pp)
         peer_layers = sum(peer_ri.layer_num_per_pp)

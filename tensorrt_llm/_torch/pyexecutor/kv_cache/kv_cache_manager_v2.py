@@ -1821,6 +1821,8 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.kv_cache_map: dict[int, _KVCache] = {}
         self._disagg_receive_ready: dict[int, torch.cuda.Event] = {}
+        # See `take_disagg_prompt_len`.
+        self._disagg_prompt_lens: dict[int, int] = {}
         # See `wait_allocation_fences`.
         self._allocation_stream: torch.cuda.Stream | None = None
         self._on_allocation_stream: set[int] = set()
@@ -4077,6 +4079,32 @@ class KVCacheManagerV2(BaseResourceManager):
         target = req.context_current_position + num_tokens + self.num_extra_kv_tokens
         return kv_cache.resize(max(kv_cache.capacity, target))
 
+    def prepare_disagg_draft_gen_init(self, req: LlmRequest) -> bool:
+        """Admit the draft mirror of a disagg generation init request.
+
+        Sized for the whole prompt, like the target's ``prepare_disagg_gen_init``,
+        so the drafter context the context worker sends has pages to land in.
+        The mirror matches no reuse, so every prompt block is received. Returns
+        False, leaving the mirror suspended, when the pool cannot hold it. Only
+        a one-model draft pool receives a prompt; any other is left alone.
+        """
+        if not self.is_draft:
+            return True
+        kv_cache = self._mirror_draft_kv_cache(req)
+        if kv_cache is None or not self._resume_and_restore(req.py_request_id, kv_cache):
+            return False
+        target = req.prompt_len + get_draft_token_length(req) + self.num_extra_kv_tokens
+        if not kv_cache.resize(max(kv_cache.capacity, target), req.prompt_len):
+            kv_cache.suspend()
+            return False
+        self._disagg_prompt_lens[req.py_request_id] = req.prompt_len
+        return True
+
+    def take_disagg_prompt_len(self, request_id: int) -> int | None:
+        """Hand over how many prompt tokens of drafter context a disagg context
+        worker sends into this pool for ``request_id``, or None if it sends none."""
+        return self._disagg_prompt_lens.pop(request_id, None)
+
     def prepare_disagg_gen_init(self, req: LlmRequest) -> bool:
         """Prepare KV cache for a disagg generation init request.
 
@@ -4091,8 +4119,8 @@ class KVCacheManagerV2(BaseResourceManager):
         # Deliberately no claim cap here: a disagg generation-init request
         # receives its prompt KV from the context worker and never runs a
         # prefill forward on this engine, so there is no drafter hidden state
-        # to recover. Spec decode on a disagg engine is guard-refused anyway
-        # (disagg_dflash_error).
+        # to recover. A hidden-state drafter's context arrives the same way,
+        # in the draft pool (prepare_disagg_draft_gen_init).
         if self.enable_block_reuse:
             _settle_context_cursor(req, reused, self.tokens_per_block)
 
@@ -5915,6 +5943,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # both leak and let a recycled page skip its fill.
         self._fresh_pages_filled.pop(request.py_request_id, None)
         self._disagg_receive_ready.pop(request.py_request_id, None)
+        self._disagg_prompt_lens.pop(request.py_request_id, None)
         self._on_allocation_stream.discard(request.py_request_id)
         self._allocation_ready.pop(request.py_request_id, None)
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
@@ -6192,6 +6221,7 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache.close()
         self.kv_cache_map.clear()
         self._disagg_receive_ready.clear()
+        self._disagg_prompt_lens.clear()
         self._on_allocation_stream.clear()
         self._allocation_ready.clear()
         self._request_stats_enabled_ids.clear()

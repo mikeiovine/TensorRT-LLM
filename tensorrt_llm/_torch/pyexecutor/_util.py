@@ -4470,9 +4470,22 @@ def create_py_executor_instance(
     if isinstance(kv_cache_manager, BaseMambaCacheManager):
         mamba_cache_manager = kv_cache_manager
 
+    # A one-model draft pool holds drafter context that a disaggregated
+    # generation worker cannot recompute, so it is sent with the target's KV.
+    # The V2 scheduler is what admits its mirror at disagg generation init.
+    transferred_draft_kv_cache_manager = resources.get(
+        ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+    if not (isinstance(kv_cache_manager, KVCacheManagerV2) and getattr(
+            transferred_draft_kv_cache_manager, "is_draft", False)):
+        transferred_draft_kv_cache_manager = None
     kv_cache_transceiver = create_kv_cache_transceiver(
-        mapping, dist, kv_cache_manager, attention_type,
-        cache_transceiver_config, mamba_cache_manager)
+        mapping,
+        dist,
+        kv_cache_manager,
+        attention_type,
+        cache_transceiver_config,
+        mamba_cache_manager,
+        draft_kv_cache_manager=transferred_draft_kv_cache_manager)
 
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else

@@ -837,11 +837,17 @@ class KVCacheV2Scheduler(RequestScheduler):
         Returns ``(action, tokens)``.  *tokens* is 0 because disagg requests
         don't participate in the forward pass token budget.
         """
-        # Cache-transceiver mode disables the separate one-model draft manager,
-        # so disagg generation init has no paired-reuse path. Supporting one
-        # would also require draft KV transfer and history_length=prompt_len.
+        # A standalone drafter's pool receives its prompt context alongside the
+        # target's. Admitting it first lets the readiness event the target
+        # records cover both pools' admission work on the shared stream.
+        draft_manager = self.draft_kv_cache_manager
+        if draft_manager is not None and not draft_manager.prepare_disagg_draft_gen_init(req):
+            logger.debug("prepare_disagg_draft_gen_init failed for request %s", req.py_request_id)
+            return ScheduleAction.SKIP, 0
         if not self.kv_cache_manager.prepare_disagg_gen_init(req):
             logger.debug("prepare_disagg_gen_init failed for request %s", req.py_request_id)
+            if draft_manager is not None:
+                draft_manager.suspend_request(req)
             return ScheduleAction.SKIP, 0
         return ScheduleAction.SCHEDULED, 0
 

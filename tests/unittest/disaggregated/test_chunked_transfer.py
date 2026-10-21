@@ -1043,6 +1043,7 @@ def _build_prefill_chunk_tokens_for(
     )
 
     transceiver = MagicMock()
+    transceiver._draft_reuse_adapter = None
     transceiver._kv_cache_manager.tokens_per_block = _REUSE_TPB
     transceiver._describe_local = MagicMock(return_value=whole)
     transceiver._page_table = SimpleNamespace(

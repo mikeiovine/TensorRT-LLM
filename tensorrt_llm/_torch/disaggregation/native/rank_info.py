@@ -20,7 +20,10 @@ import msgpack
 
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
+    append_draft_page_table,
+    build_page_table_from_manager,
+)
 from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes
@@ -70,9 +73,15 @@ class RankInfo:
         kv_cache_manager: KVCacheManager,
         device_id: int,
         aux_buffer_meta: Optional[AuxBufferMeta] = None,
+        draft_kv_cache_manager: Optional[KVCacheManager] = None,
     ) -> "RankInfo":
         m = kv_cache_manager.mapping
         kvm = kv_cache_manager
+        page_table = build_page_table_from_manager(kvm)
+        if draft_kv_cache_manager is not None:
+            page_table = append_draft_page_table(
+                page_table, build_page_table_from_manager(draft_kv_cache_manager)
+            )
         enable_attention_dp = m.enable_attention_dp
         # Keep AttentionInfo on attention-free PP stages so it can still carry
         # the attention-DP topology used by Mamba transfers.  A zero head count
@@ -112,7 +121,7 @@ class RankInfo:
                 is_mla=kvm.kv_factor == 1,
             ),
             aux_meta=aux_buffer_meta,
-            page_table=build_page_table_from_manager(kvm),
+            page_table=page_table,
             bounded_replay_on_generation=getattr(kvm, "bounded_replay_on_generation", False),
         )
 

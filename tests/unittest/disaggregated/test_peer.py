@@ -37,7 +37,10 @@ from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
 )
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
+    KVRegionExtractorV1,
+    append_draft_page_table,
+)
 from tensorrt_llm._torch.disaggregation.resource.page import (
     BUFFER_ENTRY_DTYPE,
     MAMBA_CONV_ROLE,
@@ -922,6 +925,92 @@ def test_peer_registrar_exact_tpb_mapper_rejects_divisible_mismatch(mapper_kind)
 
     with pytest.raises(ValueError):
         reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+
+def _with_draft_pool(page_table, draft_heads_per_rank):
+    """``page_table`` plus a one-layer draft pool holding ``draft_heads_per_rank`` KV heads."""
+    draft_page_table = KVCachePageTable(
+        tokens_per_block=32,
+        layer_groups=[
+            AttentionLayerGroup(
+                pool_group_idx=0,
+                kv_head_num_per_rank=draft_heads_per_rank,
+                local_layers=[LocalLayer(local_layer_id=0, global_layer_id=0)],
+                pool_views=[
+                    PoolView(
+                        pool_idx=0,
+                        buffer_entries=np.array(
+                            [(0, 0, 256), (0, 256, 256)], dtype=BUFFER_ENTRY_DTYPE
+                        ),
+                    )
+                ],
+            )
+        ],
+        pool_groups=[
+            PhysicalPoolGroup(pools=[PhysicalPool(base_address=0xC000, slot_bytes=512, num_slots=8)])
+        ],
+    )
+    return append_draft_page_table(page_table, draft_page_table)
+
+
+def test_draft_pool_pairs_only_with_the_peer_draft_pool():
+    self_ri = make_rankinfo(instance_name="local", page_table=_with_draft_pool(make_page_table(), 1))
+    reg = _make_peer_registrar(self_ri)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        layer_num_per_pp=[2],
+        page_table=_with_draft_pool(make_page_table(), 1),
+    )
+    # Head-matched peers move every attention view intact, whatever the draft heads.
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    mapping = reg.get_pool_mapping(peer_ri)
+    # The draft layer shares local and model layer id 0 with a target layer.
+    assert mapping[(0, 0)] == (0, 0)
+    assert mapping[(2, 0)] == (2, 0)
+    assert isinstance(reg.get_kv_map(peer_ri, (2, 0), (2, 0)), IntactMapper)
+
+
+@pytest.mark.parametrize(
+    "self_draft_heads,peer_draft_heads,compatible",
+    [(2, 4, True), (1, 4, False), (2, 2, False)],
+    ids=["draft-follows-target", "local-draft-differs", "peer-draft-differs"],
+)
+def test_head_mismatched_draft_transfer_needs_target_shaped_draft_heads(
+    self_draft_heads, peer_draft_heads, compatible
+):
+    """Head-mismatched mappers slice every attention view by the target's heads per rank."""
+    self_ri = make_rankinfo(
+        instance_name="local",
+        page_table=_with_draft_pool(make_page_table(), self_draft_heads),
+    )
+    reg = _make_peer_registrar(self_ri)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=3,
+        tp_size=1,
+        kv_heads_per_rank=4,
+        layer_num_per_pp=[2],
+        page_table=_with_draft_pool(
+            make_page_table(block_bytes=[2048], mamba_tp=1), peer_draft_heads
+        ),
+    )
+    if compatible:
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    else:
+        with pytest.raises(ValueError, match="draft KV transfer"):
+            reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+
+def test_draft_pool_receiver_rejects_a_context_peer_without_one():
+    reg = _make_peer_registrar(
+        make_rankinfo(instance_name="local", page_table=_with_draft_pool(make_page_table(), 2))
+    )
+    peer_ri = make_rankinfo(instance_name="peer", instance_rank=1, page_table=make_page_table())
+    with pytest.raises(ValueError, match="sends none"):
+        reg.validate_draft_compatible(peer_ri, receiving=True)
+    # Sending to a worker that runs no drafter just leaves the draft pool behind.
+    reg.validate_draft_compatible(peer_ri)
 
 
 def test_intact_mapper_region_size_mismatch_raises():
