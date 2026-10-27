@@ -19,6 +19,7 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
+    AttentionInputType,
     CustomAttentionMask,
 )
 from tensorrt_llm._utils import get_sm_version
@@ -270,14 +271,17 @@ class FallbackFmha(Fmha):
         # gate both assume the new KV entries are the trailing slots of one
         # rank's kv_len. Reject rather than run it silently wrong; being last
         # in the library list, this makes dispatch raise.
+        num_gen_tokens = q.shape[0]
+        if forward_args.attention_input_type != AttentionInputType.generation_only:
+            # In a mixed batch ``q`` also holds the context tokens, which would
+            # otherwise trip this on a batch that has exactly one query token
+            # per generation sequence. MLA hands generation-only queries in.
+            num_gen_tokens -= metadata.num_ctx_tokens
         if (
             metadata.helix_position_offsets is not None
             and metadata._helix_spec_tokens_valid
             and metadata.num_generations > 0
-            # Count generation tokens only: in a mixed batch ``q`` also holds
-            # the context tokens, which would otherwise trip this on a batch
-            # that has exactly one query token per generation sequence.
-            and q.shape[0] - metadata.num_ctx_tokens > metadata.num_generations
+            and num_gen_tokens > metadata.num_generations
         ):
             return False
         if q is not None and q.dtype == torch.float8_e4m3fn:

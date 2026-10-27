@@ -184,9 +184,11 @@ _CUDA_GRAPH_DUMMY_RESERVED_WINDOW = 1 << 20
 CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1  # keep in sync with cuda_graph_runner.py
 
 _GUARD_PAGE_REQUEST_ID = CUDA_GRAPH_DUMMY_REQUEST_ID - _CUDA_GRAPH_DUMMY_RESERVED_WINDOW
+# Holds the page that helix prefill writes non-owned KV blocks to.
+_HELIX_TRASH_PAGE_REQUEST_ID = _GUARD_PAGE_REQUEST_ID - 1
 # Caches the manager holds for itself rather than for a request. Anything that
 # reasons about "no request is active" has to exclude these.
-_RESERVED_REQUEST_IDS = frozenset({_GUARD_PAGE_REQUEST_ID})
+_RESERVED_REQUEST_IDS = frozenset({_GUARD_PAGE_REQUEST_ID, _HELIX_TRASH_PAGE_REQUEST_ID})
 
 # Storage dtypes accepted as the history half of a mixed-precision KV cache.
 _MIXED_PRECISION_LOW_DTYPES = {"nvfp4": DataType.NVFP4}
@@ -2240,6 +2242,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self.max_admissible_sequences
             + num_reserved_index_slots
             + (1 if self._guard_page_value is not None else 0)
+            + (1 if self.supports_helix_prefill else 0)
         )
         logger.info(
             f"KVCacheManagerV2: IndexMapper capacity={index_mapper_capacity} "
@@ -2275,6 +2278,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self._log_kv_cache_pool_lifecycle_mapping()
         self._reserve_guard_page()
+        self._helix_trash_block_offsets: Optional[torch.Tensor] = None
+        if self.supports_helix_prefill:
+            self._reserve_helix_trash_page()
 
         # Last: bind the publisher socket and start its thread only once every check
         # above has passed. Constructing the manager is side-effect free, so a failure
@@ -2425,6 +2431,56 @@ class KVCacheManagerV2(BaseResourceManager):
             f"{len(self._guard_page_by_layer)} layers "
             f"{self._guard_reservation_detail()}"
         )
+
+    @property
+    def supports_helix_prefill(self) -> bool:
+        """Whether helix CP ranks run prefill here (aggregated serving).
+
+        A disaggregated generation server receives its prompt KV from a context
+        server and never prefills.
+        """
+        return self._has_cp_helix and not self.is_disagg
+
+    def _reserve_helix_trash_page(self) -> None:
+        """Reserve the page that helix prefill parks non-owned KV blocks on.
+
+        A helix prefill runs every prompt token on every CP rank, but a rank
+        stores only the KV blocks it owns. The attention metadata gives each
+        context row a page table in global block order whose non-owned entries
+        point here, so the kernels' writes to those blocks land on a page no
+        request reads. Unused page-table entries default to page 0, which a
+        live request may own, so they cannot serve this purpose.
+        """
+        kv_cache = self._create_kv_cache(_HELIX_TRASH_PAGE_REQUEST_ID, None, [1], is_dummy=True)
+        if (
+            kv_cache is None
+            or not kv_cache.resume(self._stream.cuda_stream)
+            or not kv_cache.resize(1)
+        ):
+            raise RuntimeError(
+                "KVCacheManagerV2: could not reserve the helix prefill trash page"
+            )
+        # Never committed, so the reuse tree can never hand this page out.
+        kv_cache.stop_committing()
+
+    def helix_trash_block_offsets(self) -> torch.Tensor:
+        """``[num_attention_op_pools, 2]`` K/V block offsets of the helix trash page.
+
+        Built on first use, on the execution stream, in the layout
+        ``copy_batch_block_offsets`` writes.
+        """
+        assert self.supports_helix_prefill, (
+            "helix prefill runs only on aggregated serving, where the trash page is reserved"
+        )
+        if self._helix_trash_block_offsets is None:
+            offsets = torch.zeros(
+                (self.num_attention_op_pools, 1, 2, self.max_blocks_per_seq),
+                dtype=torch.int32,
+                device="cuda",
+            )
+            self.copy_batch_block_offsets(offsets, [_HELIX_TRASH_PAGE_REQUEST_ID], 1, 1, 1)
+            self._helix_trash_block_offsets = offsets[:, 0, :, 0].contiguous()
+        return self._helix_trash_block_offsets
 
     def guard_page_index(self, layer_idx: int) -> Optional[int]:
         """Page index the attention backend should park masked entries on.
@@ -4784,12 +4840,16 @@ class KVCacheManagerV2(BaseResourceManager):
         assert not req.is_disagg_generation_init_state, (
             f"req {req.py_request_id}: use prepare_disagg_gen_init"
         )
-        if self._has_cp_helix and not req.is_dummy_request:
+        if (
+            self._has_cp_helix
+            and not req.is_dummy_request
+            and (not self.supports_helix_prefill or req.prompt_len != req.total_input_len_cp)
+        ):
             raise ValueError(
-                "resize_context is not helix-aware: its rank-local chunk "
-                "target would under-size the global ledger. Helix requests "
-                "are disagg-generation-only and must never take the context "
-                "path."
+                "Under helix, only an aggregated-serving prefill of the full "
+                "prompt takes the context path: a disaggregated generation "
+                "server receives its prompt KV, and a rank-local prompt would "
+                "under-size the global ledger."
             )
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
@@ -6539,7 +6599,23 @@ class KVCacheManagerV2(BaseResourceManager):
                     ):
                         release_resources(req, free_draft_resources=True)
                         return None
-                    success = draft_kv_cache.resize(new_capacity)
+                    draft_capacity = new_capacity
+                    if self._has_cp_helix:
+                        # The draft cache is dense: it holds the dummy's
+                        # synthetic global length, which the draft layers
+                        # address, rather than this rank's ledger share. The
+                        # longest warmup dummy cannot have that much; it keeps
+                        # the ledger-sized capacity, as its target side does.
+                        draft_capacity = max(
+                            draft_capacity,
+                            min(
+                                req.total_input_len_cp + 1 + _kv_draft + self.num_extra_kv_tokens,
+                                draft_kv_cache_manager.max_seq_len,
+                            ),
+                        )
+                    success = draft_kv_cache.resize(draft_capacity)
+                    if not success and draft_capacity > new_capacity:
+                        success = draft_kv_cache.resize(new_capacity)
                     if not success:
                         release_resources(req, free_draft_resources=True)
                         return None

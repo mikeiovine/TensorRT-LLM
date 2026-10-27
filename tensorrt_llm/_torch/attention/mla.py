@@ -30,7 +30,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.utils.fp4_utils import NVFP4_SF_VEC_SIZE
 
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, IS_CUTLASS_DSL_RUBIN_AVAILABLE
-from ..distributed import AllReduceParams
+from ..distributed import AllReduceParams, cp_allgather
 from ..locality_domain.policy import LocalityDomainExecutionPlanner, LocalityDomainPolicy
 from ..locality_domain.runtime import LocalityDomainRuntime
 from ..model_config import ModelConfig
@@ -628,14 +628,14 @@ class MLA(nn.Module):
             self.sparse_attn_hooks.initialize(self)
 
         create_dense_mha = self.sparse_attn_hooks is None or self.sparse_attn_hooks.need_dense_mha
+        # Helix prefill runs the CP group as a TP group over the heads, so each
+        # CP rank attends with its num_heads_tp_cp-head slice (the slice
+        # v_b_proj and o_proj hold) through a backend sized for it.
+        self.mha_helix_ctx = None
         if create_dense_mha:
             mha_sparse_params = self.sparse_params if self.sparse_attn_hooks is None else None
-            self.mha = create_attention(
-                config.attn_backend,
-                self.layer_idx,
-                self.num_heads_tp,
+            mha_kwargs = dict(
                 head_dim=self.qk_head_dim,
-                num_kv_heads=self.num_key_value_heads_tp,
                 pos_embd_params=self.pos_embd_params,
                 quant_config=quant_config,
                 q_scaling=q_scaling,
@@ -650,6 +650,22 @@ class MLA(nn.Module):
                 sparse_params=mha_sparse_params,
                 skip_correction_threshold=config.skip_correction_threshold,
             )
+            self.mha = create_attention(
+                config.attn_backend,
+                self.layer_idx,
+                self.num_heads_tp,
+                num_kv_heads=self.num_key_value_heads_tp,
+                **mha_kwargs,
+            )
+            if self.mapping.has_cp_helix() and self.sparse_attn_hooks is None:
+                assert self.num_key_value_heads_tp % cp_size == 0
+                self.mha_helix_ctx = create_attention(
+                    config.attn_backend,
+                    self.layer_idx,
+                    self.num_heads_tp_cp,
+                    num_kv_heads=self.num_key_value_heads_tp // cp_size,
+                    **mha_kwargs,
+                )
         else:
             self.mha = None
 
@@ -706,6 +722,8 @@ class MLA(nn.Module):
         # quant_config, which could be modified after __init__.
         if self.mha is not None:
             self.mha.update_quant_config(self.quant_config)
+        if self.mha_helix_ctx is not None:
+            self.mha_helix_ctx.update_quant_config(self.quant_config)
         self.mqa.update_quant_config(self.quant_config)
         self._fused_q_fp8_ctx_ok = False
 
@@ -959,6 +977,11 @@ class MLA(nn.Module):
     ) -> None:
         """Run the dense or sparse implementation of the shared MLA module."""
         if self.sparse_attn_hooks is not None:
+            if getattr(attn_metadata, "helix_prefill", False) and attn_metadata.num_contexts > 0:
+                raise NotImplementedError(
+                    "Helix prefill (aggregated serving) does not support sparse MLA; "
+                    "run helix on the generation servers of disaggregated serving."
+                )
             self.sparse_attn_hooks.forward(
                 self,
                 position_ids,
@@ -1514,6 +1537,11 @@ class MLA(nn.Module):
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if getattr(attn_metadata, "helix_prefill", False):
+            with attn_metadata.helix_prefill_positions():
+                return self.forward_context_helix(
+                    q, compressed_kv, k_pe, attn_metadata, output, latent_cache
+                )
         if isinstance(attn_metadata, FlashInferAttentionMetadata):
             if (
                 attn_metadata.enable_context_mla_with_cached_kv
@@ -1560,6 +1588,289 @@ class MLA(nn.Module):
         return self.forward_context_default(
             q, compressed_kv, k_pe, position_ids, attn_metadata, output, latent_cache
         )
+
+    def _helix_ctx_heads(self) -> slice:
+        """This CP rank's slice of the TP-local heads during helix prefill."""
+        start = self.mapping.cp_rank * self.num_heads_tp_cp
+        return slice(start, start + self.num_heads_tp_cp)
+
+    def _helix_ctx_expand_kv(
+        self, compressed_kv: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Expand latent KV to this CP rank's heads for helix prefill.
+
+        Returns ``k_nope`` as ``[tokens, num_heads_tp_cp, qk_nope_head_dim]``
+        and ``v`` as ``[tokens, num_heads_tp_cp * v_head_dim]``. ``v`` is the V
+        half of a kv-shaped buffer, the token stride the MLA fp8 quantize
+        kernel assumes (see forward_context_default).
+        """
+        heads = self._helix_ctx_heads()
+        num_heads = self.num_heads_tp_cp
+        nope_cols = num_heads * self.qk_nope_head_dim
+
+        # The absorption weights already hold this rank's heads unquantized
+        # (k_b_proj_trans for every TP-local head, v_b_proj for the CP slice),
+        # so expand with one GEMM over just those heads instead of all of
+        # kv_b_proj. Its output is already the [k_nope heads | v heads] layout.
+        w_k, w_v = self.k_b_proj_trans, self.v_b_proj
+        if w_k.dtype != compressed_kv.dtype:
+            w_k, w_v = self.k_b_proj_trans_dequant, self.v_b_proj_dequant
+        if (
+            w_k is not None
+            and w_v is not None
+            and w_k.dtype == compressed_kv.dtype
+            and w_v.dtype == compressed_kv.dtype
+        ):
+            # [kv_lora_rank, H * qk_nope_head_dim] and [kv_lora_rank, H * v_head_dim]
+            w_k = w_k[heads].permute(1, 0, 2).reshape(self.kv_lora_rank, nope_cols)
+            w_v = w_v.permute(2, 0, 1).reshape(self.kv_lora_rank, num_heads * self.v_head_dim)
+            kv_buf = torch.mm(compressed_kv, torch.cat((w_k, w_v), dim=1))
+        else:
+            kv = self.kv_b_proj(compressed_kv)
+            k_nope, v = kv.split(
+                [
+                    self.num_heads_tp * self.qk_nope_head_dim,
+                    self.num_heads_tp * self.v_head_dim,
+                ],
+                -1,
+            )
+            kv_buf = torch.cat(
+                (
+                    k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim)[:, heads].flatten(1),
+                    v.view(-1, self.num_heads_tp, self.v_head_dim)[:, heads].flatten(1),
+                ),
+                dim=1,
+            )
+        k_nope = kv_buf[:, :nope_cols].unflatten(-1, (num_heads, self.qk_nope_head_dim))
+        return k_nope, kv_buf[:, nope_cols:]
+
+    def _helix_ctx_full_k(self, k_nope: torch.Tensor, k_pe: torch.Tensor) -> torch.Tensor:
+        """Concatenate per-head ``k_nope`` with the shared ``k_pe`` for helix prefill."""
+        num_heads = self.num_heads_tp_cp
+        k_pe = k_pe.reshape(-1, 1, self.qk_rope_head_dim)
+        k = torch.cat((k_nope, k_pe.expand(-1, num_heads, -1)), dim=-1)
+        return k.view(-1, num_heads * self.qk_head_dim)
+
+    def _helix_restore_cached_latent(
+        self, compressed_kv: torch.Tensor, k_pe: torch.Tensor, owner: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Replace latent KV rows read from the paged cache with their owner's.
+
+        A rank's cache holds only the KV blocks it owns; rows of other blocks
+        were read from the trash page. ``owner`` gives the owning CP rank of
+        each row, so gathering every rank's rows and keeping the owner's
+        reconstructs the full latent KV on every rank.
+        """
+        latent = torch.cat([compressed_kv, k_pe], dim=-1)
+        latent_dim = latent.shape[-1]
+        gathered = cp_allgather(latent, self.mapping, dim=0)
+        gathered = gathered.view(self.mapping.cp_size, -1, latent_dim)
+        latent = gathered.gather(0, owner.view(1, -1, 1).expand(1, -1, latent_dim))[0]
+        compressed_kv, k_pe = latent.split([self.kv_lora_rank, self.qk_rope_head_dim], -1)
+        return compressed_kv.contiguous(), k_pe.contiguous()
+
+    def forward_context_helix(
+        self,
+        q: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+        latent_cache: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Prefill under helix CP (aggregated serving).
+
+        Every CP rank runs every context token, and the CP group splits the
+        heads like a TP group of size ``tp_size * cp_size``: each rank attends
+        with its ``num_heads_tp_cp``-head slice, which is the slice v_b_proj
+        and o_proj hold, so the output feeds o_proj like the generation path's
+        post-processed output. The metadata's global-order page table stores
+        only this rank's KV blocks and sends the rest to a trash page, so
+        latent KV read back from the cache is restored from its owning rank.
+        """
+        mha = self.mha_helix_ctx
+        if not isinstance(mha, TrtllmAttention):
+            raise NotImplementedError(
+                "Helix prefill requires dense MLA on the TRTLLM attention backend."
+            )
+        assert isinstance(attn_metadata, TrtllmAttentionMetadata)
+        num_heads = self.num_heads_tp_cp
+        q = q.view(-1, self.num_heads_tp, self.qk_head_dim)[:, self._helix_ctx_heads()]
+        q = q.reshape(-1, num_heads * self.qk_head_dim)
+
+        if mha.is_chunked_prefill_for_mla_context(attn_metadata) and get_sm_version() >= 100:
+            return self._forward_context_helix_chunked_prefill(
+                q, compressed_kv, latent_cache, attn_metadata, output
+            )
+        if mha.has_cached_kv_for_mla_context(
+            attn_metadata
+        ) or mha.is_chunked_prefill_for_mla_context(attn_metadata):
+            return self._forward_context_helix_cached_kv(q, latent_cache, attn_metadata, output)
+
+        k_nope, v = self._helix_ctx_expand_kv(compressed_kv)
+        k = q.new_empty(q.shape[0], num_heads, self.qk_head_dim)
+        k[..., : self.qk_nope_head_dim] = k_nope
+        # With fused RoPE the kernel takes k_pe from latent_cache instead.
+        if self.apply_rotary_emb:
+            k[..., self.qk_nope_head_dim :] = k_pe.view(-1, 1, self.qk_rope_head_dim)
+        return mha.forward(
+            q,
+            k.view(-1, num_heads * self.qk_head_dim),
+            v,
+            attn_metadata,
+            forward_args=AttentionForwardArgs(
+                attention_input_type=AttentionInputType.context_only,
+                latent_cache=latent_cache,
+                out_scale=self.out_scale,
+                output=output,
+            ),
+        )
+
+    def _forward_context_helix_cached_kv(
+        self,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+        attn_metadata: TrtllmAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Helix counterpart of forward_context_with_cached_kv."""
+        assert latent_cache is not None
+        mha = cast(TrtllmAttention, self.mha_helix_ctx)
+        # Apply RoPE, append this chunk's latent KV and assign q_pe to q.
+        mha.mla_rope_append_paged_kv_assign_q(q, latent_cache, attn_metadata)
+        full_compressed_kv, full_k_pe = mha.load_paged_kv_cache_for_mla(attn_metadata, q.dtype)
+        full_compressed_kv, full_k_pe = self._helix_restore_cached_latent(
+            full_compressed_kv, full_k_pe, attn_metadata.helix_ctx_kv_owner
+        )
+        full_k_nope, full_v = self._helix_ctx_expand_kv(full_compressed_kv)
+        full_k = self._helix_ctx_full_k(full_k_nope, full_k_pe)
+        full_compressed_kv = full_k_pe = full_k_nope = None
+        # latent_cache=None: RoPE and the KV append already happened above.
+        return mha.forward(
+            q,
+            full_k,
+            full_v,
+            attn_metadata,
+            forward_args=AttentionForwardArgs(
+                attention_input_type=AttentionInputType.context_only,
+                latent_cache=None,
+                out_scale=self.out_scale,
+                output=output,
+            ),
+        )
+
+    def _forward_context_helix_chunked_prefill(
+        self,
+        q: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        latent_cache: torch.Tensor,
+        attn_metadata: TrtllmAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Helix counterpart of forward_context_with_chunked_prefill."""
+        mha = cast(TrtllmAttention, self.mha_helix_ctx)
+        num_heads = self.num_heads_tp_cp
+        # Apply RoPE, append this chunk's latent KV and assign q_pe to q.
+        mha.mla_rope_append_paged_kv_assign_q(q, latent_cache, attn_metadata)
+
+        softmax_stats = torch.empty(
+            (attn_metadata.num_ctx_tokens, num_heads, 2), dtype=torch.float, device="cuda"
+        )
+        temp_softmax_stats = torch.empty_like(softmax_stats)
+        temp_attn_output = q.new_empty((q.size(0), num_heads * self.v_head_dim))
+        buffer_batch_size = attn_metadata.runtime_features.chunked_prefill_buffer_batch_size
+
+        origin_kv_lens_cuda_runtime = attn_metadata.kv_lens_cuda_runtime
+        origin_kv_lens_runtime = attn_metadata.kv_lens_runtime
+        origin_ctx_total_kv_len = attn_metadata.host_total_kv_lens[0].item()
+
+        for loop_idx in range(attn_metadata.chunked_loop_num):
+            total_ctx_chunked_tokens = attn_metadata.host_cu_chunked_seq_len[
+                loop_idx, attn_metadata.num_contexts
+            ]
+            chunked_compressed_kv, chunked_k_pe = mha.load_chunked_kv_cache_for_mla(
+                metadata=attn_metadata,
+                num_ctx_cached_tokens=total_ctx_chunked_tokens,
+                cu_chunked_seq_len=attn_metadata.cu_chunked_seq_len[loop_idx],
+                chunked_global_offset=attn_metadata.chunked_global_offset[loop_idx],
+                chunked_max_seq_len=attn_metadata.max_chunk_len_per_loop[loop_idx],
+                out_dtype=q.dtype,
+            )
+            chunked_compressed_kv, chunked_k_pe = self._helix_restore_cached_latent(
+                chunked_compressed_kv,
+                chunked_k_pe,
+                attn_metadata.helix_chunked_kv_owner[loop_idx],
+            )
+            chunked_k_nope, chunked_v = self._helix_ctx_expand_kv(chunked_compressed_kv)
+            chunked_k = self._helix_ctx_full_k(chunked_k_nope, chunked_k_pe)
+            chunked_compressed_kv = chunked_k_pe = chunked_k_nope = None
+
+            attn_metadata.kv_lens_runtime = attn_metadata.host_chunked_seq_len[loop_idx]
+            attn_metadata.kv_lens_cuda_runtime = attn_metadata.chunked_seq_len[loop_idx]
+            attn_metadata.host_total_kv_lens[0] = total_ctx_chunked_tokens
+            # No mask within the loop; latent_cache=None skips RoPE and the KV append.
+            temp_attn_output = mha.forward(
+                q,
+                chunked_k,
+                chunked_v,
+                attn_metadata,
+                forward_args=AttentionForwardArgs(
+                    attention_input_type=AttentionInputType.context_only,
+                    latent_cache=None,
+                    out_scale=self.out_scale,
+                    attention_mask=PredefinedAttentionMask.FULL,
+                    softmax_stats_tensor=temp_softmax_stats,
+                    chunked_prefill_buffer_batch_size=buffer_batch_size,
+                    output=temp_attn_output,
+                ),
+            )
+            mha.merge_attention_for_mla(
+                output,
+                temp_attn_output,
+                softmax_stats,
+                temp_softmax_stats,
+                attn_metadata.merge_op_tensor[loop_idx],
+                attn_metadata,
+            )
+
+        # The uncached tokens were computed on every rank, so they need no restore.
+        k_nope, v = self._helix_ctx_expand_kv(compressed_kv)
+        _, k_pe = latent_cache.view([-1, self.kv_lora_rank + self.qk_rope_head_dim]).split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], -1
+        )
+        k = self._helix_ctx_full_k(k_nope, k_pe)
+
+        attn_metadata.kv_lens_runtime = attn_metadata.prompt_lens_cpu_runtime
+        attn_metadata.kv_lens_cuda_runtime = attn_metadata.prompt_lens_cuda_runtime
+        attn_metadata.host_total_kv_lens[0] = (
+            attn_metadata.prompt_lens_cpu_runtime[: attn_metadata.num_contexts].sum().item()
+        )
+        temp_attn_output = mha.forward(
+            q,
+            k,
+            v,
+            attn_metadata,
+            forward_args=AttentionForwardArgs(
+                attention_input_type=AttentionInputType.context_only,
+                latent_cache=None,
+                out_scale=self.out_scale,
+                softmax_stats_tensor=temp_softmax_stats,
+                chunked_prefill_buffer_batch_size=buffer_batch_size,
+                output=temp_attn_output,
+            ),
+        )
+        mha.merge_attention_for_mla(
+            output,
+            temp_attn_output,
+            softmax_stats,
+            temp_softmax_stats,
+            attn_metadata.merge_op_tensor[attn_metadata.chunked_loop_num],
+            attn_metadata,
+        )
+        attn_metadata.kv_lens_runtime = origin_kv_lens_runtime
+        attn_metadata.kv_lens_cuda_runtime = origin_kv_lens_cuda_runtime
+        attn_metadata.host_total_kv_lens[0] = origin_ctx_total_kv_len
+        return output
 
     def _bmm_bf16_out(
         self, a, b_no_transpose, b_transposed, output, locality_domain_weight_shards=None

@@ -335,16 +335,23 @@ def test_estimation_prepare_promotes_skip_est_for_v2() -> None:
 def test_scheduler_allocation_failure_raises_under_helix() -> None:
     """Precedent-consistent no-evict stance: allocation failure under helix
     raises instead of entering the (unvalidated-under-helix) eviction path."""
-    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import (
-        KVCacheV2Scheduler,
-        _RecomputePauseState,
-    )
+    sched, req, budget = _helix_scheduler_stand_in(enable_recompute_pause=False)
+    with pytest.raises(RuntimeError, match="eviction is disabled under helix"):
+        _schedule_generation(sched, req, budget)
+
+
+def _helix_scheduler_stand_in(enable_recompute_pause: bool):
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 
     sched = SimpleNamespace(
         has_cp_helix=True,
+        # False on a disaggregated generation server, which cannot replay a prefill.
+        enable_recompute_pause=enable_recompute_pause,
         kv_cache_manager=SimpleNamespace(try_allocate_generation=lambda req: False),
         draft_kv_cache_manager=None,
         enable_joint_kv_cache_reuse=False,
+        _joint_draft_manager=None,
+        _admit_unpaired_draft=lambda req: True,
     )
     sched._try_allocate_generation = types.MethodType(
         KVCacheV2Scheduler._try_allocate_generation, sched
@@ -355,20 +362,48 @@ def test_scheduler_allocation_failure_raises_under_helix() -> None:
         py_draft_tokens=None,
     )
     budget = SimpleNamespace(can_fit_tokens=lambda n: True)
-    with pytest.raises(RuntimeError, match="eviction is disabled under helix"):
-        KVCacheV2Scheduler._try_schedule_generation(
-            sched,
-            req,
-            budget,
-            requests_list=[req],
-            req_it=0,
-            req_it_end=1,
-            recompute_pause_state=_RecomputePauseState(1),
-            evicted=[],
-            recompute_paused=[],
-            inflight_request_ids=set(),
-            scheduled_beam_width=0,
-        )
+    return sched, req, budget
+
+
+def _schedule_generation(sched, req, budget):
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import (
+        KVCacheV2Scheduler,
+        _RecomputePauseState,
+    )
+
+    return KVCacheV2Scheduler._try_schedule_generation(
+        sched,
+        req,
+        budget,
+        requests_list=[req],
+        req_it=0,
+        req_it_end=1,
+        recompute_pause_state=_RecomputePauseState(1),
+        evicted=[],
+        recompute_paused=[],
+        inflight_request_ids=set(),
+        scheduled_beam_width=0,
+    )
+
+
+def test_aggregated_helix_allocation_failure_takes_eviction_ladder() -> None:
+    """Aggregated helix prefills on the CP group, so a request can be
+    recompute-paused like any other: allocation failure must reach the
+    eviction ladder instead of raising."""
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import ScheduleAction
+
+    sched, req, budget = _helix_scheduler_stand_in(enable_recompute_pause=True)
+    evict_calls = []
+
+    def try_evict_for_gen(req, requests_list, req_it, req_it_end, evicted, inflight_request_ids):
+        evict_calls.append(req.py_request_id)
+        return req_it_end, True
+
+    sched._try_evict_for_gen = try_evict_for_gen
+    action, tokens, _, _ = _schedule_generation(sched, req, budget)
+    assert evict_calls == [7]
+    assert action == ScheduleAction.SCHEDULED
+    assert tokens == 1
 
 
 def test_dummy_frozen_fields_sum_invariant() -> None:
@@ -380,3 +415,195 @@ def test_dummy_frozen_fields_sum_invariant() -> None:
             seqlens = [token_num - 1 if r == cp_size - 1 else token_num for r in range(cp_size)]
             total = token_num * cp_size - 1
             assert sum(seqlens) == total
+
+
+def test_resize_context_requires_the_full_prompt() -> None:
+    """Aggregated helix prefills the full prompt on every CP rank and sizes the
+    global ledger from it; a rank-local (disagg generation) prompt must never
+    take the context path."""
+    mgr = SimpleNamespace(_has_cp_helix=True, supports_helix_prefill=True, kv_cache_map={})
+    full = SimpleNamespace(
+        py_request_id=1,
+        is_disagg_generation_init_state=False,
+        is_dummy_request=False,
+        prompt_len=70,
+        total_input_len_cp=70,
+    )
+    # No cache yet: the guard passes and the resize reports a plain failure.
+    assert KVCacheManagerV2.resize_context(mgr, full, 32) is False
+    rank_local = SimpleNamespace(**{**vars(full), "prompt_len": 38})
+    with pytest.raises(ValueError, match="full prompt"):
+        KVCacheManagerV2.resize_context(mgr, rank_local, 32)
+    # A disaggregated generation server never prefills, even a full prompt.
+    disagg = SimpleNamespace(**{**vars(mgr), "supports_helix_prefill": False})
+    with pytest.raises(ValueError, match="receives its prompt KV"):
+        KVCacheManagerV2.resize_context(disagg, full, 32)
+
+
+@pytest.mark.parametrize("cp_size,phys", [(2, 4), (4, 4), (4, 32), (8, 2)])
+def test_aggregated_prefill_layout_matches_decode(cp_size: int, phys: int) -> None:
+    """Helix prefill writes global block b to rank b % cp_size, local block
+    b // cp_size (the global-order page table in TrtllmAttentionMetadata).
+    That must be exactly the rank-local order decode reads, and the first
+    decode step after the prefill must continue right behind it."""
+    for prompt_len in (1, phys - 1, phys, 3 * phys + 1, 5 * cp_size * phys + 3):
+        firsts = []
+        for rank in range(cp_size):
+            m = _mgr(rank, cp_size, phys)
+            owned = [p for p in range(prompt_len) if (p // phys) % cp_size == rank]
+            for pos in owned:
+                block = pos // phys
+                local_index = (block // cp_size) * phys + pos % phys
+                assert local_index == KVCacheManagerV2._helix_local_len(m, pos)
+            req = SimpleNamespace(total_input_len_cp=prompt_len, py_helix_decode_group_index=0)
+            KVCacheManagerV2._set_helix_rank_fields(m, req)
+            active = not req.py_helix_is_inactive_rank
+            # past_seen (model_engine convention) is what the prefill stored here.
+            assert req.seqlen_this_rank_cp - (1 if active else 0) == len(owned)
+            firsts.append(active)
+        assert firsts.count(True) == 1
+        assert firsts.index(True) == (prompt_len // phys) % cp_size
+
+
+def _metadata_stand_in(cp_size: int, cp_rank: int, phys: int, local, num_contexts: int, trash):
+    import torch
+
+    return SimpleNamespace(
+        num_contexts=num_contexts,
+        num_seqs=local.shape[1],
+        mapping=SimpleNamespace(cp_size=cp_size, cp_rank=cp_rank),
+        kv_cache_manager=SimpleNamespace(
+            tokens_per_block=phys,
+            helix_trash_block_offsets=lambda: torch.tensor([trash], dtype=torch.int32),
+        ),
+        kv_cache_block_offsets=local,
+        _helix_local_block_offsets=None,
+    )
+
+
+@pytest.mark.parametrize("cp_rank", [0, 1, 2])
+def test_global_order_page_table(cp_rank: int) -> None:
+    import torch
+
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
+    cp_size, phys, width = 3, 4, 4
+    trash = [-7, -8]
+    # [pools, seqs, K/V, width]: one context row, one generation row.
+    local = torch.zeros((1, 2, 2, width), dtype=torch.int32)
+    local[0, 0, 0] = torch.tensor([10, 11, 12, 13])
+    local[0, 0, 1] = local[0, 0, 0] + 1000
+    local[0, 1, 0] = torch.tensor([20, 21, 22, 23])
+    local[0, 1, 1] = local[0, 1, 0] + 1000
+    meta = _metadata_stand_in(cp_size, cp_rank, phys, local, 1, trash)
+    # A 30-token context row spans 8 global blocks; the generation row is local.
+    kv_lens = torch.tensor([30, 9], dtype=torch.int32)
+    TrtllmAttentionMetadata._present_helix_context_block_offsets(meta, kv_lens)
+
+    table = meta.kv_cache_block_offsets
+    assert meta._helix_local_block_offsets is local
+    assert table.shape == (1, 2, 2, 8)
+    for block in range(8):
+        if block % cp_size == cp_rank:
+            expected = [10 + block // cp_size, 1010 + block // cp_size]
+        else:
+            expected = trash
+        assert table[0, 0, :, block].tolist() == expected, block
+    assert torch.equal(table[0, 1, :, :width], local[0, 1])
+
+
+def test_helix_kv_owner() -> None:
+    import torch
+
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
+    meta = _metadata_stand_in(2, 0, 4, torch.zeros((1, 1, 2, 4), dtype=torch.int32), 1, [0, 0])
+    starts = torch.tensor([0, 6], dtype=torch.int64)
+    lengths = torch.tensor([9, 3], dtype=torch.int32)
+    owner = TrtllmAttentionMetadata._helix_kv_owner(meta, starts, lengths)
+    positions = list(range(0, 9)) + list(range(6, 9))
+    assert owner.tolist() == [(p // 4) % 2 for p in positions]
+
+
+def test_draft_forward_sees_dense_kv_lengths() -> None:
+    """One-engine draft layers stay dense under helix: inside the draft scope
+    they must see global KV lengths and no helix decode state, and the target
+    view must come back intact afterwards."""
+    import torch
+
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
+    class _Meta(SimpleNamespace):
+        swap_for_draft = TrtllmAttentionMetadata.swap_for_draft
+        record_draft_swap = TrtllmAttentionMetadata.record_draft_swap
+        restore_draft_swaps = TrtllmAttentionMetadata.restore_draft_swaps
+        prepare_for_draft_forward = TrtllmAttentionMetadata.prepare_for_draft_forward
+        restore_after_draft_forward = TrtllmAttentionMetadata.restore_after_draft_forward
+        _present_dense_kv_for_draft = TrtllmAttentionMetadata._present_dense_kv_for_draft
+
+    # One 30-token context row (already global), two generation rows verifying
+    # groups of 3 at global positions 100 and 200 with rank-local lengths 9.
+    kv_lens_cuda = torch.tensor([30, 9, 9, 0], dtype=torch.int32)
+    positions = torch.tensor([100, 101, 102, 200, 201, 202, 0, 0], dtype=torch.int32)
+    inactive = torch.tensor([False, True], dtype=torch.bool)
+    host_kv = torch.tensor([30, 9, 9], dtype=torch.int32)
+    meta = _Meta(
+        enable_helix=True,
+        num_contexts=1,
+        num_seqs=3,
+        seq_lens_cuda=torch.tensor([30, 3, 3], dtype=torch.int32),
+        kv_lens_cuda=kv_lens_cuda,
+        kv_lens_cuda_runtime=kv_lens_cuda[:3],
+        kv_lens_runtime=host_kv,
+        host_total_kv_lens=torch.tensor([30, 18], dtype=torch.int32),
+        helix_position_offsets=positions,
+        helix_is_inactive_rank=inactive,
+        _helix_spec_tokens_valid=True,
+        helix_draft_kv_lens_cuda=torch.zeros(4, dtype=torch.int32),
+        helix_dense_kv_lens_cpu=torch.tensor([106, 206, 0, 0], dtype=torch.int32),
+        draft_replay_swapped_attrs={},
+    )
+
+    saved = meta.prepare_for_draft_forward()
+    assert meta.kv_lens_cuda[:3].tolist() == [30, 103, 203]
+    assert meta.kv_lens_cuda_runtime.tolist() == [30, 103, 203]
+    assert meta.kv_lens_runtime.tolist() == [30, 106, 206]
+    assert meta.host_total_kv_lens.tolist() == [30, 312]
+    assert meta.helix_position_offsets is None
+    assert meta.helix_is_inactive_rank is None
+    assert meta._helix_spec_tokens_valid is False
+    # The target's own buffers are untouched (a CUDA graph replay runs this
+    # before the captured target forward).
+    assert kv_lens_cuda.tolist() == [30, 9, 9, 0]
+
+    meta.restore_draft_swaps()
+    meta.restore_after_draft_forward(saved)
+    assert meta.kv_lens_cuda is kv_lens_cuda
+    assert meta.kv_lens_runtime is host_kv
+    assert meta.helix_position_offsets is positions
+    assert meta.helix_is_inactive_rank is inactive
+    assert meta._helix_spec_tokens_valid is True
+    assert meta.host_total_kv_lens.tolist() == [30, 18]
+
+
+def test_aggregated_helix_speculation_modes() -> None:
+    from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+    from tensorrt_llm.llmapi import MTPDecodingConfig, NGramDecodingConfig
+
+    validate = KvCacheCreator._validate_aggregated_helix_speculation
+
+    def mtp(num_nextn_predict_layers: int, **kwargs) -> MTPDecodingConfig:
+        config = MTPDecodingConfig(max_draft_len=2, **kwargs)
+        # Filled from the checkpoint at model load; the constructor drops it.
+        object.__setattr__(config, "num_nextn_predict_layers", num_nextn_predict_layers)
+        return config
+
+    validate(mtp(1))
+    with pytest.raises(NotImplementedError, match="one-engine MTP"):
+        validate(mtp(2))
+    with pytest.raises(NotImplementedError, match="one-engine MTP"):
+        validate(mtp(1, use_mtp_vanilla=True))
+    with pytest.raises(NotImplementedError, match="one-engine MTP"):
+        validate(NGramDecodingConfig(max_draft_len=2, max_matching_ngram_size=2))
+    with pytest.raises(NotImplementedError, match="mid-run"):
+        validate(mtp(1, max_concurrency=8))

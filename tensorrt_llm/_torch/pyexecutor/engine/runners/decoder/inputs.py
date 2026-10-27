@@ -255,6 +255,7 @@ class HostLists:
     helix_is_inactive_rank: list[bool] = field(default_factory=list)
     helix_position_offsets: list[int] = field(default_factory=list)
     helix_owned_new_tokens: list[int] = field(default_factory=list)
+    helix_dense_kv_lens: list[int] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -1299,6 +1300,7 @@ class DecoderInputPreparer:
         previous_pos_indices = host.lists.previous_pos_indices
         unwritten_input_id_rows = host.lists.unwritten_input_id_rows
         helix_owned_new_tokens = host.lists.helix_owned_new_tokens
+        helix_dense_kv_lens = host.lists.helix_dense_kv_lens
         extra_inputs = host.extra_inputs
         _has_cp_helix = host.has_cp_helix
         _helix_local_len_host = host.helix_local_len_host
@@ -1393,6 +1395,7 @@ class DecoderInputPreparer:
                     # exact (no device correction needed).
                     group = 1 + num_draft_tokens
                     base = _helix_pack_extend(request, group)
+                    helix_dense_kv_lens.append(base + group)
                     local_cached = _helix_local_len_host(base)
                     helix_owned_new_tokens.append(
                         _helix_local_len_host(base + group) - local_cached
@@ -1438,6 +1441,8 @@ class DecoderInputPreparer:
                     # branch: the token list is rank-local under helix).
                     group = runtime_tokens_per_gen_step
                     base = _helix_pack_extend(request, group)
+                    # Full acceptance of the in-flight group, as above.
+                    helix_dense_kv_lens.append(base + 2 * group)
                     local_full = _helix_local_len_host(base + group)
                     helix_owned_new_tokens.append(0)
                     num_cached_tokens_per_seq[-1] = local_full - request.py_num_compressed_tokens
@@ -1521,6 +1526,7 @@ class DecoderInputPreparer:
         helix_is_inactive_rank = host.lists.helix_is_inactive_rank
         helix_position_offsets = host.lists.helix_position_offsets
         helix_owned_new_tokens = host.lists.helix_owned_new_tokens
+        helix_dense_kv_lens = host.lists.helix_dense_kv_lens
         position_ids = host.lists.position_ids
         unwritten_input_id_rows = host.lists.unwritten_input_id_rows
         num_cached_tokens_per_seq = host.lists.num_cached_tokens_per_seq
@@ -1652,6 +1658,7 @@ class DecoderInputPreparer:
                         # Update helix-specific parameters.
                         helix_is_inactive_rank.append(request.py_helix_is_inactive_rank)
                         helix_position_offsets.append(position_id)
+                        helix_dense_kv_lens.append(position_id + 1)
                         # Keep the per-seq owned-count list aligned when the
                         # spec path is active in the same batch. Whether the
                         # list arms the spec path at all is decided once, at
@@ -2022,6 +2029,7 @@ class DecoderInputPreparer:
                 helix_owned_new_tokens=(
                     host.lists.helix_owned_new_tokens if helix_spec_active else None
                 ),
+                helix_dense_kv_lens=host.lists.helix_dense_kv_lens,
             )
 
         if not attn_metadata.is_cuda_graph:

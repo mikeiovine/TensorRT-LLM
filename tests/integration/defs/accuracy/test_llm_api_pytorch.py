@@ -601,6 +601,49 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @parametrize_with_ids("mtp_nextn", [0, 2])
+    @parametrize_with_ids("enable_chunked_prefill", [False, True])
+    @parametrize_with_ids("overlap_scheduler", [False, True])
+    @pytest.mark.parametrize("tp_size,cp_size", [(1, 4), (2, 2)],
+                             ids=["cp4", "tp2cp2"])
+    def test_bfloat16_helix(self, tp_size, cp_size, overlap_scheduler,
+                            enable_chunked_prefill, mtp_nextn):
+        """Helix CP in aggregated serving.
+
+        Every CP rank prefills each prompt and keeps the KV blocks it owns,
+        then decodes with helix attention; MLA is the only attention helix
+        prefill supports. With MTP the target verifies each draft group on the
+        helix-sharded cache while the MTP layer keeps its own dense cache.
+        """
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+                                        enable_block_reuse=False,
+                                        tokens_per_block=32,
+                                        use_kv_cache_manager_v2=True)
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=tp_size,
+                 context_parallel_size=cp_size,
+                 moe_expert_parallel_size=tp_size * cp_size,
+                 cp_config={
+                     "cp_type": "HELIX",
+                     "tokens_per_block": 32,
+                 },
+                 kv_cache_config=kv_cache_config,
+                 enable_chunked_prefill=enable_chunked_prefill,
+                 max_num_tokens=256 if enable_chunked_prefill else 8192,
+                 disable_overlap_scheduler=not overlap_scheduler,
+                 cuda_graph_config=CudaGraphConfig(enable_padding=True,
+                                                   max_batch_size=64),
+                 speculative_config=mtp_config) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @skip_pre_hopper
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",

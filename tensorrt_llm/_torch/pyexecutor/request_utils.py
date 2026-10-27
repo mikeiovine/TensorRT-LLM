@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 import torch
 
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.bindings.executor import RequestType
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
@@ -292,8 +293,11 @@ def merge_helix_requests(
 ) -> List[LlmRequest]:
     """Merge requests for Helix CP.
 
-    Note: Helix parallelism is a decode-only feature run with disaggregated serving.
-    This function gets called on gen server during initialization of a new request.
+    A generation-only request (the generation server of disaggregated serving)
+    receives its prompt KV from a context server, so each CP rank keeps only the
+    tokens of the KV blocks it owns. Any other request runs its prefill on the
+    CP group (aggregated serving): every rank keeps the full prompt, and the
+    attention layers write only the rank's own KV blocks during prefill.
 
     Args:
         new_requests: List of RequestQueueItem objects.
@@ -308,6 +312,18 @@ def merge_helix_requests(
     req_with_children = []
 
     for req_item in new_requests:
+        if req_item.request.request_type != RequestType.REQUEST_TYPE_GENERATION_ONLY:
+            req = executor_request_to_llm_request(
+                req_item.id,
+                req_item.request,
+                req_item.child_req_ids,
+                exclude_last_generation_logits,
+            )
+            req_with_children.append(req)
+            if req.child_requests:
+                req_with_children.extend(req.child_requests)
+            continue
+
         input_ids_this_rank, position_ids_this_rank, input_len, _ = partition_context_for_helix(
             req_item.request.input_token_ids, cp_rank, cp_size, tokens_per_block
         )

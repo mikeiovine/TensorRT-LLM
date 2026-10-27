@@ -139,7 +139,7 @@ def get_attention_feature_unsupported_reason(
     forward_args: "AttentionForwardArgs",
 ) -> Optional[str]:
     """Return which optional attention feature the fused-kernel adapters do not implement."""
-    if metadata.helix_position_offsets is not None:
+    if getattr(metadata, "enable_helix", False) or metadata.helix_position_offsets is not None:
         return "Helix parallelism is not supported."
     if forward_args.relative_attention_bias is not None:
         return "relative attention bias is not supported."

@@ -445,9 +445,16 @@ class CuteDslMlaFmha(PhasedFmha):
     ) -> tuple[bool, str]:
         if fwd.attention_input_type != AttentionInputType.generation_only:
             return False, "CuTe DSL MLA FMHA only supports generation-only attention."
+        if meta.num_generations <= 0:
+            return False, "CuTe DSL MLA FMHA requires generation requests."
         # Disable mixed context/generation batches until the CuTe DSL host
-        # overhead is reduced.
-        if meta.num_contexts != 0 or meta.num_generations <= 0:
+        # overhead is reduced, except for helix verify groups: no other
+        # library can serve them (see helix_verify_group below), and helix
+        # prefill shares steps with them in aggregated serving.
+        helix_verify_group = (
+            meta.helix_position_offsets is not None and q.shape[0] > meta.num_generations
+        )
+        if meta.num_contexts != 0 and not helix_verify_group:
             return False, "CuTe DSL MLA FMHA only supports decode-only batches."
         if meta.beam_width != 1:
             return False, f"Beam search is not supported, got beam_width={meta.beam_width}."
@@ -487,19 +494,17 @@ class CuteDslMlaFmha(PhasedFmha):
 
         from tensorrt_llm._torch.autotuner import AutoTuner
 
-        # A multi-token verify group at H=96 has nowhere else to go: TRTLLM-Gen
-        # rejects 64 < num_heads_q < 128 outright, so falling through the perf
-        # gate does not reach a faster kernel, it reaches an executor-init
-        # failure. That makes this a correctness carve-out rather than a perf
-        # tradeoff, so it is decided here instead of being folded into
-        # _PERF_MIN_BATCH_FP8, which stays a pure measured-win table.
-        # Single-token H=96 is already a measured table entry and still goes
-        # through the gate. Helix with seq_len_q > 1 implies
-        # _helix_spec_tokens_valid -- the helix block above returns False
-        # otherwise.
-        helix_h96_verify_group = (
-            attn.num_heads == 96 and seq_len_q > 1 and meta.helix_position_offsets is not None
-        )
+        # A helix verify group has nowhere else to go: its KV ownership is
+        # per-token, which only this kernel's per-token bounds express (the
+        # fallback rejects it, and FlashInfer TRTLLM-Gen and PrimTS reject
+        # helix outright), so falling through the perf gate does not reach a
+        # faster kernel, it reaches a dispatch failure. That makes this a
+        # correctness carve-out rather than a perf tradeoff, so it is decided
+        # here instead of being folded into _PERF_MIN_BATCH_FP8, which stays a
+        # pure measured-win table. Single-token helix decode still goes through
+        # the gate. Helix with seq_len_q > 1 implies _helix_spec_tokens_valid --
+        # the helix block above returns False otherwise. helix_verify_group is
+        # computed with the batch-type check at the top.
         # The same failure without Helix: an FP8-KV multi-token verify group
         # (e.g. DSpark under attention DP, where every rank keeps all 96 heads)
         # is not in the FP8 perf table, and on SM100/SM103 the next library is
@@ -516,7 +521,7 @@ class CuteDslMlaFmha(PhasedFmha):
             and self._get_kernel_dtype(attn, q) == torch.float8_e4m3fn
             and get_sm_version() in (100, 103)
         )
-        if not (helix_h96_verify_group or fp8_wide_head_verify_group):
+        if not (helix_verify_group or fp8_wide_head_verify_group):
             # Perf gate (NOT a correctness limit).
             favorable, reason = self._is_perf_favorable(
                 attn.num_heads,

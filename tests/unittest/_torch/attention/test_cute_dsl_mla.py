@@ -131,6 +131,7 @@ def _select_mla_generation_fmha(
     fp8_kv: bool,
     helix: bool,
     batch_size: int,
+    num_contexts: int = 0,
 ):
     """Run FmhaManager._select_mla over [CuteDslMlaFmha, TRTLLM-Gen stub] on CPU."""
     from tensorrt_llm._torch.attention.backends.fmha import cute_dsl_mla
@@ -161,7 +162,7 @@ def _select_mla_generation_fmha(
         layer_idx=0,
     )
     meta = SimpleNamespace(
-        num_contexts=0,
+        num_contexts=num_contexts,
         num_generations=batch_size,
         beam_width=1,
         is_spec_dec_tree=False,
@@ -204,6 +205,11 @@ def _select_mla_generation_fmha(
         # Helix H=96 verify groups are unchanged.
         (103, 96, 4, True, True, "cute_dsl_mla"),
         (107, 96, 4, True, True, "cute_dsl_mla"),
+        # Every helix verify group needs this kernel's per-token bounds, so the
+        # perf gate does not apply to other head counts either.
+        (100, 128, 4, True, True, "cute_dsl_mla"),
+        (100, 32, 4, False, True, "cute_dsl_mla"),
+        (100, 16, 2, False, True, "cute_dsl_mla"),
         # Single-token H=96 is unchanged (measured perf-table entry).
         (103, 96, 1, True, False, "cute_dsl_mla"),
         # Head counts TRTLLM-Gen serves keep the perf gate.
@@ -229,6 +235,27 @@ def test_mla_generation_routes_wide_head_fp8_verify_away_from_trtllm_gen(
             fp8_kv=fp8_kv,
             helix=helix,
             batch_size=batch_size,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("helix, expected", [(True, "cute_dsl_mla"), (False, "trtllm_gen")])
+def test_mla_generation_mixed_batch_takes_cute_dsl_only_for_helix_verify(
+    monkeypatch, helix, expected
+) -> None:
+    """Aggregated helix prefill shares steps with helix verify groups, which
+    only this kernel can serve; other mixed batches keep avoiding it."""
+    assert (
+        _select_mla_generation_fmha(
+            monkeypatch,
+            sm=100,
+            num_heads=32,
+            seq_len_q=3,
+            fp8_kv=False,
+            helix=helix,
+            batch_size=4,
+            num_contexts=2,
         )
         == expected
     )

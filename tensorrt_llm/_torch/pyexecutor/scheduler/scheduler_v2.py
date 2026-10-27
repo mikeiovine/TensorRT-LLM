@@ -1553,10 +1553,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         success = self._try_allocate_generation(req)
 
         if not success:
-            if self.has_cp_helix:
-                # No-evict stance: every validated helix run used
-                # GUARANTEED_NO_EVICT semantics; eviction stays off under
-                # helix until a KV-pressure e2e validates it.
+            if self.has_cp_helix and not self.enable_recompute_pause:
+                # No-evict stance for disaggregated helix generation servers:
+                # every validated run used GUARANTEED_NO_EVICT semantics, and
+                # a request that received its prompt KV cannot replay its
+                # prefill. Aggregated helix prefills on the CP group, so it
+                # takes the ordinary eviction and recompute ladder below.
                 raise RuntimeError(
                     f"[V2Scheduler] KV allocation failed for helix request "
                     f"{req.py_request_id}; eviction is disabled under helix "

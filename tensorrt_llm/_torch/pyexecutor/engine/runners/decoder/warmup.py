@@ -276,6 +276,16 @@ class DecoderWarmup:
     def guided_decoder(self) -> CapturableGuidedDecoder | None:
         return self._inputs.guided_decoder
 
+    def _is_helix_decode_only(self, kv_cache_manager) -> bool:
+        """Whether this is a helix CP rank that never prefills.
+
+        Helix ranks prefill only in aggregated serving; the generation servers
+        of disaggregated serving receive their prompt KV.
+        """
+        return self.mapping.has_cp_helix() and not getattr(
+            kv_cache_manager, "supports_helix_prefill", False
+        )
+
     def run(self, resource_manager: ResourceManager) -> EagerWorkspaceReclaimer | None:
         """Warm up and capture graphs; return the eager workspace reclaimer to serve with."""
         kv_cache_manager = resource_manager.get_resource_manager(
@@ -381,9 +391,10 @@ class DecoderWarmup:
         # ``guided_decoder`` is installed only on the last pipeline rank, so
         # this predicate is not rank-uniform on its own. Agree it before it
         # gates either the attention or the general phase.
+        helix_decode_only = self._is_helix_decode_only(kv_cache_manager)
         can_run_general_warmup = self._agreement.agree_flag(
             self._context_warmups_supported
-            and not self.mapping.has_cp_helix()
+            and not helix_decode_only
             and self.guided_decoder is None
             and not isinstance(kv_cache_manager, MambaHybridCacheManager)
         )
@@ -425,8 +436,9 @@ class DecoderWarmup:
                     gc.collect()
                     torch.cuda.empty_cache()
 
-        # Helix CP is decode-only, so it tunes on generation requests.
-        if self._context_warmups_supported and self.mapping.has_cp_helix():
+        # A disaggregated helix generation server never prefills, so it tunes
+        # on generation requests.
+        if self._context_warmups_supported and helix_decode_only:
             with (
                 self._warmup_timer.phase(
                     "autotuner", metrics=self._metrics, metric_name="autotuner_warmup_seconds"
@@ -790,9 +802,12 @@ class DecoderWarmup:
     def _general_warmup_impl(
         self, resource_manager: ResourceManager, warmup_requests_configs: list[tuple[int, int]]
     ) -> None:
+        helix_decode_only = self._is_helix_decode_only(
+            resource_manager.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER)
+        )
         for num_tokens, num_gen_tokens in warmup_requests_configs:
-            # Helix CP does not support warmup with context requests.
-            if self.mapping.has_cp_helix() and num_tokens != num_gen_tokens:
+            # A disaggregated helix generation server never prefills.
+            if helix_decode_only and num_tokens != num_gen_tokens:
                 continue
             try:
                 with self._dummy_requests.release_batch_context(

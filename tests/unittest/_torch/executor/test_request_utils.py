@@ -628,6 +628,19 @@ def test_single_round_idle_path_keeps_cpu_probe():
     assert dist.calls == [("broadcast_int64", [0], True)]
 
 
+def _generation_only_request(input_tokens, max_tokens):
+    """A disaggregated generation-server request, whose prompt KV comes from a context server."""
+    return trtllm.Request(
+        input_token_ids=input_tokens,
+        max_tokens=max_tokens,
+        streaming=False,
+        sampling_config=trtllm.SamplingConfig(),
+        output_config=trtllm.OutputConfig(),
+        type=trtllm.RequestType.REQUEST_TYPE_GENERATION_ONLY,
+        context_phase_params=trtllm.ContextPhaseParams([100], 1, None, None, None, None),
+    )
+
+
 def test_merge_helix_requests_with_padding():
     """Test merge_helix_requests with basic valid input."""
 
@@ -635,13 +648,7 @@ def test_merge_helix_requests_with_padding():
 
     # Create request item with 13 tokens to get exactly 7 blocks for 4 CP ranks.
     input_tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
-    executor_request = trtllm.Request(
-        input_token_ids=input_tokens,
-        max_tokens=5,
-        streaming=False,
-        sampling_config=trtllm.SamplingConfig(),
-        output_config=trtllm.OutputConfig(),
-    )
+    executor_request = _generation_only_request(input_tokens, max_tokens=5)
     request_item = RequestQueueItem(
         id=1,
         request=executor_request,
@@ -686,13 +693,7 @@ def test_merge_helix_requests_without_padding():
 
     # Create request item with 12 tokens to get exactly 3 blocks for 2 CP ranks.
     input_tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-    executor_request = trtllm.Request(
-        input_token_ids=input_tokens,
-        max_tokens=5,
-        streaming=False,
-        sampling_config=trtllm.SamplingConfig(),
-        output_config=trtllm.OutputConfig(),
-    )
+    executor_request = _generation_only_request(input_tokens, max_tokens=5)
     request_item = RequestQueueItem(
         id=1,
         request=executor_request,
@@ -735,13 +736,7 @@ def test_merge_helix_requests_empty_ranks():
 
     # 12 tokens -> 3 blocks, which is fewer than 4 CP ranks, so rank 3 is empty.
     input_tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-    executor_request = trtllm.Request(
-        input_token_ids=input_tokens,
-        max_tokens=12,
-        streaming=False,
-        sampling_config=trtllm.SamplingConfig(),
-        output_config=trtllm.OutputConfig(),
-    )
+    executor_request = _generation_only_request(input_tokens, max_tokens=12)
     request_item = RequestQueueItem(
         id=1,
         request=executor_request,
@@ -791,13 +786,7 @@ def test_merge_helix_requests_empty_ranks_with_padding():
 
     # 10 tokens -> 3 blocks (last block half-full), fewer than 4 CP ranks.
     input_tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    executor_request = trtllm.Request(
-        input_token_ids=input_tokens,
-        max_tokens=12,
-        streaming=False,
-        sampling_config=trtllm.SamplingConfig(),
-        output_config=trtllm.OutputConfig(),
-    )
+    executor_request = _generation_only_request(input_tokens, max_tokens=12)
     request_item = RequestQueueItem(
         id=1,
         request=executor_request,
@@ -856,13 +845,7 @@ def test_merge_requests_with_helix_cp_config():
 
     # Create request item with 13 tokens to get exactly 7 blocks for 4 CP ranks.
     input_tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
-    executor_request = trtllm.Request(
-        input_token_ids=input_tokens,
-        max_tokens=5,
-        streaming=False,
-        sampling_config=trtllm.SamplingConfig(),
-        output_config=trtllm.OutputConfig(),
-    )
+    executor_request = _generation_only_request(input_tokens, max_tokens=5)
     request_item = RequestQueueItem(
         id=1,
         request=executor_request,
@@ -903,6 +886,35 @@ def test_merge_requests_with_helix_cp_config():
             assert llm_request.get_tokens(0) == [5, 6, 13]
         else:
             assert llm_request.get_tokens(0) == [7, 8]
+
+def test_merge_helix_requests_keeps_full_prompt_for_aggregated():
+    """A context-and-generation request prefills on the CP group (aggregated
+    serving), so every CP rank keeps the full prompt and its global length."""
+    input_tokens = list(range(1, 14))
+    executor_request = trtllm.Request(
+        input_token_ids=input_tokens,
+        max_tokens=5,
+        streaming=False,
+        sampling_config=trtllm.SamplingConfig(),
+        output_config=trtllm.OutputConfig(),
+    )
+    request_item = RequestQueueItem(id=1, request=executor_request)
+    cp_config = {"cp_type": CpType.HELIX, "tokens_per_block": 2}
+
+    for rank in range(4):
+        result = merge_requests(
+            [request_item],
+            cp_config=cp_config,
+            cp_rank=rank,
+            cp_size=4,
+            exclude_last_generation_logits=False,
+        )
+        assert len(result) == 1
+        llm_request = result[0]
+        assert llm_request.get_tokens(0) == input_tokens
+        assert llm_request.prompt_len == len(input_tokens)
+        assert llm_request.total_input_len_cp == len(input_tokens)
+        assert llm_request.py_helix_decode_group_index == 0
 
 
 def test_get_from_waiting_queue():

@@ -990,6 +990,8 @@ class KvCacheCreator:
             cache_transceiver_config=self._cache_transceiver_config)
         cls = self._validate_or_fallback_kv_cache_manager_v2(
             cls, model_config, kv_cache_config)
+        if self._mapping.has_cp_helix() and not self._is_disagg:
+            self._validate_aggregated_helix(model_config, cls)
         if is_hybrid_linear(model_config.pretrained_config):
             logger.info_once(
                 f"Selected hybrid KV cache manager: {cls.__name__}",
@@ -1005,6 +1007,83 @@ class KvCacheCreator:
                     "Block reuse does not work with MTP for hybrid linear models "
                     f"when using non-V2 Mamba cache manager {cls.__name__}")
         return cls
+
+    def _validate_aggregated_helix(self, model_config: ModelConfig,
+                                   kv_cache_manager_cls) -> None:
+        """Reject what helix prefill (aggregated serving) does not support.
+
+        Without disaggregation the CP group runs each request's prefill too:
+        every rank runs every prompt token and keeps only the KV blocks it
+        owns. That path exists for dense MLA on the TRTLLM backend with
+        KVCacheManagerV2.
+        """
+        if (not is_mla(model_config.pretrained_config)
+                or model_config.sparse_attention_config is not None
+                or model_config.attn_backend != "TRTLLM"):
+            raise NotImplementedError(
+                "Helix context parallelism in aggregated serving supports "
+                "dense MLA models (e.g. DeepSeek-V3) on the TRTLLM attention "
+                "backend; other models run helix only on the generation "
+                "servers of disaggregated serving.")
+        if not issubclass(kv_cache_manager_cls, KVCacheManagerV2):
+            raise ValueError(
+                "Helix context parallelism in aggregated serving requires "
+                "kv_cache_config.use_kv_cache_manager_v2=True (resolved "
+                f"{kv_cache_manager_cls.__name__}).")
+        if self._speculative_config is not None:
+            self._validate_aggregated_helix_speculation(
+                self._speculative_config)
+        if self._mapping.enable_attention_dp:
+            raise NotImplementedError(
+                "Attention DP with helix context parallelism is supported "
+                "only on the generation servers of disaggregated serving.")
+        # Both replace the per-step block table that helix prefill swaps in.
+        if self._kv_cache_config.mixed_precision_kv is not None:
+            raise NotImplementedError(
+                "Mixed-precision KV cache is not supported with helix "
+                "context parallelism in aggregated serving.")
+        if self._llm_args.prefill_cuda_graph_backend != "disabled":
+            raise NotImplementedError(
+                "Prefill CUDA graphs are not supported with helix context "
+                "parallelism in aggregated serving.")
+
+    @staticmethod
+    def _validate_aggregated_helix_speculation(spec_config) -> None:
+        """Reject the speculative modes helix aggregated serving cannot run.
+
+        The target verifies a fixed-width linear group per request on the
+        helix ledger, while the draft layers stay dense: plain TP over the CP
+        group with their own unsharded KV cache. That covers one-engine MTP
+        (the Eagle-style variant a single MTP layer resolves to) and EAGLE3.
+        Turning speculation off mid-flight is rejected too: requests would
+        fall back to a helix position formula that counts iterations rather
+        than committed tokens.
+        """
+        mode = spec_config.spec_dec_mode
+        if not (mode.is_mtp_eagle_one_model() or mode.is_eagle3_one_model()):
+            raise NotImplementedError(
+                "Helix context parallelism in aggregated serving supports "
+                "speculative decoding with one-engine MTP (single MTP layer, "
+                "use_mtp_vanilla=False) or EAGLE3; got "
+                f"{spec_config.decoding_type!r}.")
+        if not spec_config.is_linear_tree:
+            raise NotImplementedError(
+                "Helix context parallelism in aggregated serving supports "
+                "linear speculative drafting only, not dynamic trees.")
+        if not should_use_separate_draft_kv_cache(spec_config):
+            raise NotImplementedError(
+                "Helix context parallelism in aggregated serving needs the "
+                "draft layers' separate KV cache: the helix-sharded target "
+                "cache cannot hold the dense draft layers.")
+        if (spec_config.acceptance_rate_window_size is not None
+                or spec_config.acceptance_rate_threshold is not None
+                or spec_config.max_concurrency is not None
+                or spec_config.draft_len_schedule is not None):
+            raise NotImplementedError(
+                "Helix context parallelism does not support turning "
+                "speculation off mid-run (acceptance_rate_window_size, "
+                "acceptance_rate_threshold, max_concurrency, "
+                "draft_len_schedule).")
 
     def _validate_or_fallback_kv_cache_manager_v2(
             self,

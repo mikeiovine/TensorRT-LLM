@@ -568,6 +568,7 @@ class AttentionMetadata:
         helix_position_offsets: List[int],
         helix_is_inactive_rank: List[bool],
         helix_owned_new_tokens: Optional[List[int]] = None,
+        helix_dense_kv_lens: Optional[List[int]] = None,
     ) -> None:
         """
         Hook to be called when using helix parallelism.

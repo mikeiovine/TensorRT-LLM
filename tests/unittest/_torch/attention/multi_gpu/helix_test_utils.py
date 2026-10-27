@@ -192,6 +192,9 @@ def setup_kv_and_metadata(
         max_batch_size=scenario.batch,
         mapping=mapping,
         dtype=str_dtype_to_binding(torch_dtype_to_str(scenario.kv_cache_dtype)),
+        # These tests model a disaggregated helix generation server, whose
+        # context step only fills the rank-local KV a context server would send.
+        is_disagg=True,
     )
     # The attention test bypasses scheduling and uses rank-local dummy caches.
     # Reserve the context plus the generation token written by this test.

@@ -229,6 +229,23 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     helix_owned_new_tokens_cpu: Optional[torch.Tensor] = None
     _helix_spec_tokens_valid: bool = False
 
+    # Helix prefill. Context rows address KV in global token positions while
+    # this rank stores only the blocks it owns, so a step with context rows
+    # swaps in a global-order page table (see
+    # _present_helix_context_block_offsets) and parks the persistent rank-local
+    # buffer here until the next prepare().
+    _helix_local_block_offsets: Optional[torch.Tensor] = None
+    # CP rank owning each row that MLA reads back from the paged cache for
+    # context requests with cached tokens: the full-history load, and each
+    # loop of the chunked-prefill load. Only the owner holds valid values.
+    helix_ctx_kv_owner: Optional[torch.Tensor] = None
+    helix_chunked_kv_owner: Optional[List[torch.Tensor]] = None
+    # One-engine speculative decoding keeps the draft layers dense: their KV
+    # cache is not CP-sharded, so they read KV lengths in global tokens while
+    # the target's are rank-local. See _present_dense_kv_for_draft.
+    helix_draft_kv_lens_cuda: Optional[torch.Tensor] = None
+    helix_dense_kv_lens_cpu: Optional[torch.Tensor] = None
+
     # Block offsets for the target and draft KV caches
     kv_cache_block_offsets: Optional[torch.Tensor] = None
     host_kv_cache_block_offsets: Optional[torch.Tensor] = None
@@ -375,6 +392,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         super().__post_init__()
         self.enable_helix = self.mapping.has_cp_helix(
         ) if self.mapping is not None else False
+        # A CUDA graph metadata is a shallow copy taken between steps; it owns
+        # its own block-offset buffer, never the eager one parked here.
+        self._helix_local_block_offsets = None
         self.use_paged_context_fmha = (
             self.runtime_features.chunked_prefill
             or self.runtime_features.cache_reuse
@@ -684,6 +704,21 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 pin_memory=prefer_pinned(),
             )
             self._helix_spec_tokens_valid = False
+            self.helix_draft_kv_lens_cuda = self.get_empty_like(
+                buffers,
+                self.prompt_lens_cuda,
+                cache_name="helix_draft_kv_lens_cuda",
+                capture_graph=capture_graph,
+            )
+            # Host-side dense KV length of each generation row, packed by the
+            # model engine (an upper bound under the overlap scheduler, like
+            # the non-helix host KV lengths).
+            self.helix_dense_kv_lens_cpu = torch.zeros(
+                (self.max_num_sequences, ),
+                device='cpu',
+                dtype=torch.int,
+                pin_memory=prefer_pinned(),
+            )
 
     def on_update_kv_lens(self):
         # KV lengths can change between speculative decoding sub-steps.
@@ -719,6 +754,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         helix_position_offsets: List[int],
         helix_is_inactive_rank: List[bool],
         helix_owned_new_tokens: Optional[List[int]] = None,
+        helix_dense_kv_lens: Optional[List[int]] = None,
     ) -> None:
         """
         Update helix parameters by copying into static buffers for CUDA graph compatibility.
@@ -730,6 +766,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 tokens owned by this rank (speculative verify groups; one
                 group may straddle a page boundary onto two ranks). None on
                 the single-token path, where the boolean flag carries it.
+            helix_dense_kv_lens: Per-sequence KV length in global tokens,
+                as a CP-unsharded cache would hold it (host upper bound).
         """
         if helix_position_offsets is not None and self.helix_position_offsets is not None:
             num_tokens = len(helix_position_offsets)
@@ -751,6 +789,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.helix_owned_new_tokens_cpu[:batch_size].copy_(
                 torch.tensor(helix_owned_new_tokens, dtype=torch.int))
             self._helix_spec_tokens_valid = True
+
+        if (helix_dense_kv_lens is not None
+                and self.helix_dense_kv_lens_cpu is not None):
+            batch_size = len(helix_dense_kv_lens)
+            self.helix_dense_kv_lens_cpu[:batch_size].copy_(
+                torch.tensor(helix_dense_kv_lens, dtype=torch.int))
 
     def helix_local_len_vec(self, global_lens: torch.Tensor) -> torch.Tensor:
         """Vectorized rank-local prefix length for helix round-robin pages.
@@ -914,11 +958,57 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Prepare backend state shared by draft-forward execution paths."""
+        if self.enable_helix:
+            return self._present_dense_kv_for_draft()
         return None
 
     def restore_after_draft_forward(self, saved_state: dict | None) -> None:
         """Restore backend state modified for draft-forward execution."""
+        if saved_state is not None and "host_total_kv_lens" in saved_state:
+            self.host_total_kv_lens.copy_(saved_state["host_total_kv_lens"])
         return None
+
+    def _present_dense_kv_for_draft(self) -> dict:
+        """Present the KV lengths of a CP-unsharded cache to the draft layers.
+
+        Under helix the draft layers of one-engine speculative decoding are
+        dense: they run as plain TP over the CP group with a separate draft KV
+        cache holding every token. The target's generation rows carry
+        rank-local KV lengths and the helix decode state (global positions,
+        inactive-rank flags, per-token write slots), all of which would make the
+        draft kernels attend to and append the wrong KV. Swap in dense lengths
+        and hide the helix state; context rows already count global tokens.
+
+        The device lengths come from the (overlap-corrected) global position of
+        each generation row's first token. They go to a dedicated buffer rather
+        than kv_lens_cuda: a CUDA graph replay runs this hook before the
+        captured target forward, which still reads kv_lens_cuda.
+        """
+        num_contexts, num_seqs = self.num_contexts, self.num_seqs
+        num_gens = num_seqs - num_contexts
+        dense = self.helix_draft_kv_lens_cuda
+        dense[:num_contexts].copy_(self.kv_lens_cuda[:num_contexts])
+        host_dense = self.kv_lens_runtime.clone()
+        if num_gens > 0:
+            # helix_position_offsets is generation-relative: one entry per
+            # generation token.
+            gen_lens = self.seq_lens_cuda[num_contexts:num_seqs]
+            first_token = torch.cumsum(gen_lens, 0) - gen_lens
+            first_positions = self.helix_position_offsets.index_select(
+                0, first_token.long())
+            dense[num_contexts:num_seqs].copy_(first_positions + gen_lens)
+            host_dense[num_contexts:num_seqs] = (
+                self.helix_dense_kv_lens_cpu[:num_gens])
+        saved = {"host_total_kv_lens": self.host_total_kv_lens.clone()}
+        self.host_total_kv_lens[1] = int(
+            host_dense[num_contexts:num_seqs].sum())
+        self.swap_for_draft("kv_lens_cuda", dense)
+        self.swap_for_draft("kv_lens_cuda_runtime", dense[:num_seqs])
+        self.swap_for_draft("kv_lens_runtime", host_dense)
+        self.swap_for_draft("helix_position_offsets", None)
+        self.swap_for_draft("helix_is_inactive_rank", None)
+        self.swap_for_draft("_helix_spec_tokens_valid", False)
+        return saved
 
     def token_major_gen_view(self) -> Optional["TokenMajorGenView"]:
         """The token-major generation presentation, or None.
@@ -984,6 +1074,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
              self.host_request_types_runtime) = saved
 
     def prepare(self) -> None:
+        if self._helix_local_block_offsets is not None:
+            self.kv_cache_block_offsets = self._helix_local_block_offsets
+            self._helix_local_block_offsets = None
         super().prepare()
         # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.
         self._invalidate_mla_scheduler_buffers()
@@ -1078,6 +1171,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # prepare for kv cache reuse/chunked context in MLA
         if self.enable_context_mla_with_cached_kv:
             self.prepare_context_mla_with_cached_kv(cached_token_lens, kv_lens)
+            if self.helix_prefill:
+                self._prepare_helix_cached_kv_owners(kv_lens)
 
         # kv block offsets
         assert self.request_ids is not None
@@ -1124,6 +1219,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     self.num_seqs,
                     max_blocks=max_blocks)
 
+            if self.helix_prefill and self.num_contexts > 0:
+                self._present_helix_context_block_offsets(kv_lens)
+
         # Don't pass self.kv_lens as kv_lens here because it includes extra
         # tokens. Use the actual KV length (without extra tokens) for
         # kv_lens_runtime, which becomes host_past_key_value_lengths and
@@ -1154,6 +1252,101 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # Native BF16 paged-context FMHA reads 32-token pages.
             self.prepare_mixed_precision_kv(
                 "HND", min(self.kv_cache_manager.tokens_per_block, 32))
+
+    @property
+    def helix_prefill(self) -> bool:
+        """Whether helix CP ranks run the context rows (aggregated serving).
+
+        A disaggregated helix generation server receives its prompt KV instead.
+        """
+        return self.enable_helix and getattr(self.kv_cache_manager,
+                                             "supports_helix_prefill", False)
+
+    @contextlib.contextmanager
+    def helix_prefill_positions(self) -> Iterator[None]:
+        """Hide the helix decode position state from helix prefill kernels.
+
+        ``helix_position_offsets`` holds the global positions of generation
+        rows only, but a context kernel handed the buffer reads it as the
+        positions of its own tokens. Helix prefill rows are already addressed
+        by global KV-cache position, which is what those kernels use without it.
+        """
+        saved = (self.helix_position_offsets, self.helix_is_inactive_rank)
+        self.helix_position_offsets = None
+        self.helix_is_inactive_rank = None
+        try:
+            yield
+        finally:
+            self.helix_position_offsets, self.helix_is_inactive_rank = saved
+
+    def _present_helix_context_block_offsets(self,
+                                             kv_lens: torch.Tensor) -> None:
+        """Give context rows a page table in global block order.
+
+        A helix prefill runs every prompt token on every CP rank, so the
+        context kernels address KV by global token position, but this rank
+        stores only the blocks it owns: global block ``b`` lives on CP rank
+        ``b % cp_size`` as that rank's local block ``b // cp_size``. Entries of
+        blocks owned by other ranks point at the KV cache manager's trash page,
+        so writes to them are discarded, and reads from them return garbage
+        that MLA replaces with the owner's values (``helix_ctx_kv_owner``).
+        Generation rows keep their rank-local tables.
+        """
+        num_contexts, num_seqs = self.num_contexts, self.num_seqs
+        cp_size, cp_rank = self.mapping.cp_size, self.mapping.cp_rank
+        local = self.kv_cache_block_offsets
+        num_pools, _, kv_factor, width = local.shape
+        num_blocks = max(
+            width,
+            ceil_div(int(kv_lens[:num_contexts].max()),
+                     self.kv_cache_manager.tokens_per_block))
+        trash = self.kv_cache_manager.helix_trash_block_offsets()[:num_pools]
+        table = trash[:, None, :, None].expand(num_pools, num_seqs, kv_factor,
+                                               num_blocks).contiguous()
+        table[:, num_contexts:, :, :width] = local[:, num_contexts:num_seqs]
+        block = torch.arange(num_blocks, device=local.device)
+        owned = block % cp_size == cp_rank
+        local_block = torch.clamp(block // cp_size, max=width - 1)
+        owned_offsets = local[:, :num_contexts].index_select(-1, local_block)
+        table[:, :num_contexts] = torch.where(owned, owned_offsets,
+                                              table[:, :num_contexts])
+        self._helix_local_block_offsets = local
+        self.kv_cache_block_offsets = table
+
+    def _helix_kv_owner(self, starts: torch.Tensor,
+                        lengths: torch.Tensor) -> torch.Tensor:
+        """CP rank owning each row of per-request KV ranges laid back to back.
+
+        ``starts`` and ``lengths`` are host tensors over the context requests:
+        request ``i`` contributes the rows of global positions
+        ``[starts[i], starts[i] + lengths[i])``.
+        """
+        lengths = lengths.to(torch.int64)
+        total = int(lengths.sum())
+        shift = starts.to(torch.int64) - (torch.cumsum(lengths, 0) - lengths)
+        device = self.kv_cache_block_offsets.device
+        shift = shift.to(device, non_blocking=True).repeat_interleave(
+            lengths.to(device, non_blocking=True), output_size=total)
+        position = torch.arange(total, device=device) + shift
+        return (position //
+                self.kv_cache_manager.tokens_per_block) % self.mapping.cp_size
+
+    def _prepare_helix_cached_kv_owners(self, kv_lens: torch.Tensor) -> None:
+        self.helix_ctx_kv_owner = None
+        self.helix_chunked_kv_owner = None
+        if self.num_contexts == 0 or self.num_ctx_cached_tokens == 0:
+            return
+        num_contexts = self.num_contexts
+        self.helix_ctx_kv_owner = self._helix_kv_owner(
+            torch.zeros(num_contexts, dtype=torch.int64),
+            kv_lens[:num_contexts])
+        if self.runtime_features.chunked_prefill:
+            self.helix_chunked_kv_owner = [
+                self._helix_kv_owner(
+                    self.host_chunked_global_offset[loop_idx, :num_contexts],
+                    self.host_chunked_seq_len[loop_idx, :num_contexts])
+                for loop_idx in range(self.chunked_loop_num)
+            ]
 
     def _on_mixed_precision_kv_prepared(self, view) -> None:
         """Lay out the staging pages as TRTLLM block offsets for this batch."""
