@@ -8082,12 +8082,33 @@ class TorchLlmArgs(BaseLlmArgs):
                                                   "dspark_markov_rank")
                         if markov_rank is not None:
                             spec_cfg.markov_rank = markov_rank
+                # Experimental parallel drafting (see
+                # tensorrt_llm/_torch/speculative/dspark_parallel.py): the
+                # first token of each block stands in for the target's next
+                # token, so a block of K verifies K - 1 drafts.
+                parallel_draft = os.environ.get(
+                    "TRTLLM_DSPARK_PARALLEL_DRAFT",
+                    "0").strip().lower() in ("1", "true", "yes", "on")
+                expected_block_size = spec_cfg.max_draft_len + int(
+                    parallel_draft)
                 if spec_cfg.block_size is None:
-                    spec_cfg.block_size = spec_cfg.max_draft_len
+                    spec_cfg.block_size = expected_block_size
                 if spec_cfg.block_size <= 0:
                     raise ValueError(
                         "DSpark block_size must be greater than zero")
-                if spec_cfg.block_size != spec_cfg.max_draft_len:
+                if parallel_draft:
+                    if spec_cfg.block_size != expected_block_size:
+                        raise ValueError(
+                            "DSpark parallel drafting requires block_size == "
+                            "max_draft_len + 1; got "
+                            f"block_size={spec_cfg.block_size} and "
+                            f"max_draft_len={spec_cfg.max_draft_len}. Set "
+                            f"max_draft_len={spec_cfg.block_size - 1}.")
+                    if spec_cfg.enable_confidence_scheduling:
+                        raise ValueError(
+                            "DSpark parallel drafting does not support "
+                            "enable_confidence_scheduling")
+                elif spec_cfg.block_size != spec_cfg.max_draft_len:
                     raise ValueError(
                         "DSpark block_size must equal max_draft_len; got "
                         f"block_size={spec_cfg.block_size} and "

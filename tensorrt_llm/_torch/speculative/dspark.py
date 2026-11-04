@@ -35,6 +35,15 @@ from ..distributed import AllReduceStrategy
 from ..modules.linear import Linear, TensorParallelMode
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from .dflash import DFlashWorker, VocabParallelDraftTokens, dflash_draft_slot_ids
+from .dspark_parallel import (
+    DSparkParallelDraftConfig,
+    anchor_rows,
+    backfill_plan,
+    broadcast_rank0_rows,
+    context_extent,
+    inflight_fill_valid,
+    resolve_hits,
+)
 from .dspark_schedule import NEUTRAL_CONFIDENCE_LOGIT
 from .interface import SpecMetadata, SpecWorkerBase
 from .vocab_parallel import tp_pair_exchange
@@ -266,6 +275,7 @@ class DSparkSpecMetadata(SpecMetadata):
         # ``DFlashSpecMetadata.prepare`` (dflash.py:96-113).
         worker = getattr(self, "_dspark_worker", None)
         if worker is not None and worker._win_inited:
+            worker._maybe_log_parallel_stats()
             current = set(self.request_ids)
             for rid in list(worker._req_to_slot.keys()):
                 if rid not in current:
@@ -274,6 +284,7 @@ class DSparkSpecMetadata(SpecMetadata):
                     worker._valid_len[slot].zero_()
                     worker._position_initialized[slot].zero_()
                     worker._kv_windows[slot].zero_()
+                    worker._reset_parallel_slot(slot)
                     worker._free_slots.append(slot)
             # Assign a persistent rolling-window slot to every real generation
             # request that never ran a context/seed forward on this worker. In
@@ -308,6 +319,7 @@ class DSparkSpecMetadata(SpecMetadata):
             worker._ctx_len[scratch].zero_()
             worker._valid_len[scratch].zero_()
             worker._position_initialized[scratch].zero_()
+            worker._reset_parallel_slot(scratch)
             mapping = torch.tensor(
                 [worker._req_to_slot.get(rid, scratch) for rid in self.request_ids],
                 dtype=torch.long,
@@ -404,6 +416,18 @@ class DSv4DSparkWorker(SpecWorkerBase):
     Reference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).
     """
 
+    # Parallel-drafting defaults; ``__init__`` overrides them. Class-level so an
+    # instance built without ``__init__`` stays on the sequential path.
+    _parallel = DSparkParallelDraftConfig()
+    _par_hit: Optional[torch.Tensor] = None
+    _par_pending: Optional[torch.Tensor] = None
+    _par_prev_kv: Optional[torch.Tensor] = None
+    _par_prev_frame0: Optional[torch.Tensor] = None
+    _par_stats: Optional[torch.Tensor] = None
+    _par_stream: Optional[torch.cuda.Stream] = None
+    _par_launched = False
+    _par_warmup_snapshot: Optional[dict] = None
+
     def __init__(
         self,
         spec_config: "DSparkDecodingConfig",
@@ -455,6 +479,35 @@ class DSv4DSparkWorker(SpecWorkerBase):
         # Host-side planner turning the confidence snapshot into this
         # iteration's draft length; built in ``_lazy_init``.
         self.verify_planner = None
+
+        # Parallel drafting (experimental, see dspark_parallel.py). The draft
+        # for the next step is launched before the target forward and
+        # committed after verification. Slot-indexed state, allocated in
+        # ``_lazy_init``:
+        #   _par_hit         [rows] bool: last parallel draft is valid, so the
+        #                    next draft anchors on the last in-flight token
+        #   _par_pending     [rows, block] int32: last parallel draft's tokens
+        #   _par_prev_kv     [rows, stages, block, head_dim]: its block K/V
+        #   _par_prev_frame0 [rows] long: frame of its block slot 0 (0: none)
+        #   _par_stats       [3] int64: gen rows, hits, accepted tokens
+        self._parallel = DSparkParallelDraftConfig.from_env(mapping.world_size)
+        if self._parallel.enabled and self.return_confidence:
+            raise ValueError(
+                "DSpark parallel drafting does not support confidence scheduling; "
+                "set enable_confidence_scheduling=False"
+            )
+        self._par_hit: Optional[torch.Tensor] = None
+        self._par_pending: Optional[torch.Tensor] = None
+        self._par_prev_kv: Optional[torch.Tensor] = None
+        self._par_prev_frame0: Optional[torch.Tensor] = None
+        self._par_stats: Optional[torch.Tensor] = None
+        self._par_stats_last = (0, 0, 0)
+        self._par_prepare_calls = 0
+        self._par_stream: Optional[torch.cuda.Stream] = None
+        self._par_launched = False
+        self._par_warmup_snapshot: Optional[dict] = None
+        if self._parallel.enabled:
+            logger.info(f"DSpark parallel drafting enabled: {self._parallel}")
 
         # The generation draft path is the batched, host-sync-free
         # ``_draft_gen_block_batched`` + ``DSv4DSparkDraftModel.forward_batched`` +
@@ -579,7 +632,15 @@ class DSv4DSparkWorker(SpecWorkerBase):
 
     def _lazy_init(self, draft_model, spec_metadata, attn_metadata=None) -> None:
         block_size = int(draft_model.block_size)
-        if block_size != self.max_draft_len:
+        if self._parallel.enabled:
+            # The parallel draft's first token stands in for the target's next
+            # token, so a block of K yields K - 1 drafts to verify.
+            if block_size != self.max_draft_len + 1:
+                raise ValueError(
+                    "DSpark parallel drafting requires block_size == max_draft_len + 1; "
+                    f"got block_size={block_size} and max_draft_len={self.max_draft_len}"
+                )
+        elif block_size != self.max_draft_len:
             raise ValueError(
                 "DSpark draft model block_size must equal worker max_draft_len; "
                 f"got block_size={block_size} and max_draft_len={self.max_draft_len}"
@@ -650,6 +711,21 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 with torch.inference_mode(False):
                     self._draft_seq_cuda = torch.zeros((), dtype=torch.int32, device="cuda")
                 self._build_verify_planner(draft_model, block_size)
+            if self._parallel.enabled:
+                self._par_hit = torch.zeros(num_rows, dtype=torch.bool, device="cuda")
+                self._par_pending = torch.zeros(
+                    (num_rows, block_size), dtype=torch.int32, device="cuda"
+                )
+                if self._parallel.fill_inflight:
+                    self._par_prev_kv = torch.zeros(
+                        (num_rows, num_stages, block_size, head_dim),
+                        dtype=torch.bfloat16,
+                        device="cuda",
+                    )
+                    self._par_prev_frame0 = torch.zeros(num_rows, dtype=torch.long, device="cuda")
+                self._par_stats = torch.zeros(3, dtype=torch.int64, device="cuda")
+                if self._parallel.overlap:
+                    self._par_stream = torch.cuda.Stream(priority=self._parallel.stream_priority)
             self._free_slots = deque(range(max_batch))
             self._req_to_slot = {}
             logger.info(
@@ -768,6 +844,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._valid_len[slot].zero_()
             self._position_initialized[slot].zero_()
             self._kv_windows[slot].zero_()
+            self._reset_parallel_slot(slot)
             if self._confidence_logits is not None:
                 # A recycled slot still holds the previous occupant's scores;
                 # reset to neutral so the first scheduling decision verifies
@@ -1018,6 +1095,376 @@ class DSv4DSparkWorker(SpecWorkerBase):
         gen_draft_tokens = torch.stack(gen_draft_tokens, dim=1)
         return gen_draft_tokens
 
+    # ------------------------------------------------------------------
+    # Parallel drafting (experimental; see dspark_parallel.py)
+    # ------------------------------------------------------------------
+
+    def _reset_parallel_slot(self, slot: int) -> None:
+        """Return a slot's parallel-draft state to "recovering, nothing stashed"."""
+        if self._par_hit is None:
+            return
+        self._par_hit[slot] = False
+        self._par_pending[slot].zero_()
+        if self._par_prev_frame0 is not None:
+            self._par_prev_frame0[slot] = 0
+            self._par_prev_kv[slot].zero_()
+
+    def _can_use_rejection_sampling(self, spec_metadata: SpecMetadata) -> bool:
+        """Parallel drafts carry no draft distributions: verify strictly.
+
+        Strict verification still samples each target position with the
+        request's own parameters, so non-greedy output stays exact; it only
+        accepts less often than rejection sampling would.
+        """
+        if self._parallel.enabled:
+            return False
+        return super()._can_use_rejection_sampling(spec_metadata)
+
+    def _parallel_state(self) -> dict:
+        """Persistent tensors a parallel step mutates (warmup must restore them)."""
+        names = (
+            "_ctx_len",
+            "_valid_len",
+            "_position_initialized",
+            "_kv_windows",
+            "_par_hit",
+            "_par_pending",
+            "_par_prev_kv",
+            "_par_prev_frame0",
+            "_par_stats",
+        )
+        return {name: getattr(self, name) for name in names if getattr(self, name) is not None}
+
+    def _sync_parallel_tokens(self) -> bool:
+        """Whether replicated drafts must be unified across the TP group."""
+        mapping = self.mapping
+        return (
+            self._parallel.replicate
+            and self._parallel.sync_tokens
+            and mapping is not None
+            and mapping.tp_size > 1
+            and not mapping.enable_attention_dp
+        )
+
+    def _maybe_log_parallel_stats(self) -> None:
+        """Log the parallel-draft hit rate every ``stats_interval`` steps.
+
+        Runs from ``DSparkSpecMetadata.prepare`` (host, every step, also under
+        CUDA-graph replay). Reading the device counters synchronizes, which is
+        why the log is opt-in.
+        """
+        interval = self._parallel.stats_interval
+        if not interval or self._par_stats is None:
+            return
+        self._par_prepare_calls += 1
+        if self._par_prepare_calls % interval:
+            return
+        rows, hits, accepted = (int(v) for v in self._par_stats.tolist())
+        prev_rows, prev_hits, prev_accepted = self._par_stats_last
+        self._par_stats_last = (rows, hits, accepted)
+        d_rows = rows - prev_rows
+        if d_rows <= 0 or rows <= 0:
+            return
+        logger.info(
+            f"DSpark parallel draft: last {interval} steps: {d_rows} gen rows, "
+            f"hit rate {(hits - prev_hits) / d_rows:.3f}, "
+            f"accepted tokens/row {(accepted - prev_accepted) / d_rows:.3f}; "
+            f"cumulative: hit rate {hits / rows:.3f}, accepted tokens/row "
+            f"{accepted / rows:.3f}"
+        )
+
+    def launch_parallel_draft(
+        self, input_ids, position_ids, attn_metadata, spec_metadata, draft_model
+    ) -> None:
+        """Enqueue the next step's draft before the target forward.
+
+        Called by ``SpecDecOneEngineForCausalLM.forward`` ahead of the target.
+        With ``overlap`` the draft runs on a side stream forked from the
+        current one and is joined in ``_forward_impl`` after verification;
+        otherwise it runs inline (serially) on the current stream. Every
+        intermediate is created on the stream that uses it, and the draft
+        writes only slot-indexed persistent buffers, so nothing is freed on
+        one stream while the other still reads it.
+        """
+        if not self._parallel.enabled or spec_metadata is None or input_ids is None:
+            return
+        if getattr(attn_metadata, "csa2_remote_tail_mode", None) == "source":
+            # The model returns before the worker runs; nothing would join.
+            return
+        self._lazy_init(draft_model, spec_metadata, attn_metadata)
+        spec_metadata._dspark_worker = self
+        if spec_metadata.verify_lens is not None:
+            raise RuntimeError("DSpark parallel drafting requires uniform verification windows")
+
+        is_warmup = (
+            getattr(spec_metadata, "is_cuda_graph", False)
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        self._par_warmup_snapshot = (
+            {name: t.clone() for name, t in self._parallel_state().items()} if is_warmup else None
+        )
+        self._par_launched = True
+
+        batch_size = attn_metadata.num_seqs
+        num_contexts = attn_metadata.num_contexts
+        num_gens = batch_size - num_contexts
+        block = int(draft_model.block_size)
+        # A sharded drafter (emulated mode) keeps the sequential path's
+        # FUSED_COMM MoE lockstep: every rank crosses the draft MoE the same
+        # number of times with the same per-rank token list.
+        all_rank_num_gens = getattr(spec_metadata, "all_rank_num_gens", None)
+        all_rank_draft_tokens = (
+            [max(1, int(g) * block) for g in all_rank_num_gens]
+            if all_rank_num_gens is not None and not self._parallel.replicate
+            else None
+        )
+        if num_gens == 0:
+            if all_rank_draft_tokens is not None and max(all_rank_num_gens) > 0:
+                draft_model.run_moe_lockstep_noop(all_rank_draft_tokens, input_ids.device)
+            return
+
+        args = (
+            input_ids,
+            position_ids,
+            attn_metadata,
+            spec_metadata,
+            draft_model,
+            num_contexts,
+            batch_size,
+            all_rank_draft_tokens,
+        )
+        if self._par_stream is None:
+            self._run_parallel_draft(*args)
+            return
+        self._par_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self._par_stream):
+            self._run_parallel_draft(*args)
+
+    def _run_parallel_draft(
+        self,
+        input_ids,
+        position_ids,
+        attn_metadata,
+        spec_metadata,
+        draft_model,
+        num_contexts: int,
+        batch_size: int,
+        all_rank_draft_tokens: Optional[List[int]],
+    ) -> None:
+        """Draft one block per gen request from verified context only."""
+        num_gens = batch_size - num_contexts
+        width = spec_metadata.runtime_draft_len + 1
+        block = int(draft_model.block_size)
+        device = input_ids.device
+        flat_ids = input_ids.reshape(-1)
+        flat_pos = position_ids.reshape(-1)
+        last = flat_ids.shape[0] - 1
+
+        slots = self._batch_to_slot[num_contexts:batch_size]
+        base = attn_metadata.num_ctx_tokens + torch.arange(num_gens, device=device) * width
+        anchors = anchor_rows(self._par_hit[slots], width)
+        rows = (base + anchors).clamp(max=last)
+        anchor_ids = flat_ids.index_select(0, rows).long()
+        anchor_pos = flat_pos.index_select(0, rows).long()
+        # Row 0 is the committed bonus; the window holds every frame up to its
+        # position (frame = position + 1 stores the hidden state at position).
+        ctx_end = flat_pos.index_select(0, base.clamp(max=last)).long()
+        if self._position_cap is not None:
+            anchor_pos = anchor_pos.clamp(max=self._position_cap)
+            ctx_end = ctx_end.clamp(max=self._position_cap)
+        num_ctx = context_extent(ctx_end, self._valid_len[slots], anchor_pos, self._win)
+
+        extra_kv = extra_valid = None
+        if self._par_prev_kv is not None:
+            extra_kv = self._par_prev_kv[slots]
+            extra_valid = inflight_fill_valid(
+                self._par_prev_frame0[slots], block, ctx_end, anchor_pos
+            )
+
+        draft_tokens, block_kv = draft_model.forward_parallel(
+            anchor_ids,
+            anchor_pos,
+            ctx_end,
+            num_ctx,
+            kv_windows=self._kv_windows,
+            slots=slots,
+            extra_kv=extra_kv,
+            extra_valid=extra_valid,
+            all_rank_num_tokens=all_rank_draft_tokens,
+        )
+        self._par_pending[slots] = draft_tokens.to(torch.int32)
+        if self._par_prev_kv is not None:
+            self._par_prev_kv[slots] = block_kv.to(self._par_prev_kv.dtype)
+            self._par_prev_frame0[slots] = anchor_pos + 1
+
+    def _commit_parallel_step(
+        self,
+        draft_model,
+        spec_metadata,
+        attn_metadata,
+        position_ids,
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        num_contexts: int,
+        batch_size: int,
+        total_target_tokens: int,
+    ) -> torch.Tensor:
+        """Back-fill verified context, resolve hits, and return the next drafts.
+
+        Returns ``[num_gens, runtime_draft_len]`` int32 drafts: the parallel
+        draft's tokens after its first one. On a miss these are filler that
+        verification rejects or, if they happen to match, legitimately accepts.
+        """
+        num_gens = batch_size - num_contexts
+        width = spec_metadata.runtime_draft_len + 1
+        block = int(draft_model.block_size)
+        device = accepted_tokens.device
+        captured = spec_metadata.get_hidden_states(total_target_tokens)
+        if captured is None:
+            raise RuntimeError(
+                "DSpark parallel drafting requires captured target hidden states; "
+                "check target_layer_ids and the target model's capture hooks."
+            )
+
+        slots = self._batch_to_slot[num_contexts:batch_size]
+        is_scratch = slots == self._scratch_slot
+        nacc = num_accepted_tokens[num_contexts:batch_size].long()
+        base = attn_metadata.num_ctx_tokens + torch.arange(num_gens, device=device) * width
+        flat_pos = position_ids.reshape(-1)
+        ctx_end = flat_pos.index_select(0, base.clamp(max=flat_pos.shape[0] - 1)).long()
+        if self._position_cap is not None:
+            ctx_end = ctx_end.clamp(max=self._position_cap)
+
+        # The accepted in-flight tokens' hidden states extend the verified
+        # window; a bootstrapped (disaggregated) slot starts from empty.
+        rows, frames, mask = backfill_plan(nacc, width, base, ctx_end)
+        mask = mask & ~is_scratch.unsqueeze(1)
+        rows = torch.where(mask, rows, torch.zeros_like(rows)).clamp(max=captured.shape[0] - 1)
+        if self._position_cap is not None:
+            frames = frames.clamp(max=self._position_cap + block)
+        draft_model.write_context_windows_batched(
+            captured[rows], frames, slots, mask, self._kv_windows
+        )
+        self._valid_len[slots] = torch.clamp(self._valid_len[slots] + nacc, max=self._win)
+        self._ctx_len[slots] = ctx_end + nacc
+        self._position_initialized[slots] = torch.ones_like(slots, dtype=torch.bool)
+
+        pending = self._par_pending[slots]
+        if self._sync_parallel_tokens():
+            pending = broadcast_rank0_rows(pending, self.mapping)
+        anchors = anchor_rows(self._par_hit[slots], width)
+        bonus = (
+            accepted_tokens[num_contexts:batch_size]
+            .gather(1, (nacc - 1).clamp(min=0).unsqueeze(1))
+            .squeeze(1)
+        )
+        if self.force_num_accepted_tokens > 0:
+            # Synthetic acceptance (perf benchmarking) commits tokens nobody
+            # verified, so neither the bonus nor the anchor row says anything
+            # about the draft. Model the timing instead: a step hits when the
+            # whole in-flight window was accepted, so forcing max_draft_len
+            # gives the steady-state parallel pipeline.
+            hit = (nacc == width) & ~is_scratch
+        else:
+            hit = resolve_hits(nacc, anchors, bonus, pending[:, 0]) & ~is_scratch
+        self._par_hit[slots] = hit
+
+        real = ~is_scratch
+        self._par_stats.add_(
+            torch.stack([real.sum(), hit.sum(), (nacc * real).sum()]).to(self._par_stats.dtype)
+        )
+        return pending[:, 1:width].contiguous()
+
+    def _forward_impl_parallel(
+        self,
+        input_ids,
+        position_ids,
+        logits,
+        attn_metadata,
+        spec_metadata,
+        draft_model,
+    ):
+        batch_size = attn_metadata.num_seqs
+        num_contexts = attn_metadata.num_contexts
+        num_gens = batch_size - num_contexts
+        if self.guided_decoder is not None:
+            raise NotImplementedError("DSpark parallel drafting does not support guided decoding")
+        if not self._par_launched:
+            # No pre-target launch this step (a caller other than
+            # SpecDecOneEngineForCausalLM.forward): draft serially now.
+            self.launch_parallel_draft(
+                input_ids, position_ids, attn_metadata, spec_metadata, draft_model
+            )
+        self._par_launched = False
+
+        accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
+            logits, attn_metadata, spec_metadata
+        )
+        # Everything below writes state the draft reads.
+        if self._par_stream is not None:
+            torch.cuda.current_stream().wait_stream(self._par_stream)
+
+        total_target_tokens = input_ids.shape[0]
+        if num_contexts > 0:
+            self._seed_context_windows(
+                draft_model, spec_metadata, attn_metadata, position_ids, total_target_tokens
+            )
+
+        num_drafts = spec_metadata.runtime_draft_len
+        if num_gens > 0:
+            gen_draft_tokens = self._commit_parallel_step(
+                draft_model,
+                spec_metadata,
+                attn_metadata,
+                position_ids,
+                accepted_tokens,
+                num_accepted_tokens,
+                num_contexts,
+                batch_size,
+                total_target_tokens,
+            )
+        else:
+            gen_draft_tokens = torch.empty((0, num_drafts), dtype=torch.int32, device="cuda")
+        if num_contexts > 0:
+            # Context requests verify filler on their first generation step,
+            # while the parallel draft anchors on their first token.
+            ctx_draft_tokens = torch.zeros(
+                (num_contexts, num_drafts), dtype=torch.int32, device="cuda"
+            )
+            next_draft_tokens = torch.cat([ctx_draft_tokens, gen_draft_tokens], dim=0)
+        else:
+            next_draft_tokens = gen_draft_tokens
+
+        next_new_tokens = self._prepare_next_new_tokens(
+            accepted_tokens,
+            next_draft_tokens,
+            spec_metadata.batch_indices_cuda,
+            batch_size,
+            num_accepted_tokens,
+        )
+
+        if self._par_warmup_snapshot is not None:
+            state = self._parallel_state()
+            for name, saved in self._par_warmup_snapshot.items():
+                state[name].copy_(saved)
+            self._par_warmup_snapshot = None
+
+        outputs = {
+            "logits": logits,
+            "new_tokens": accepted_tokens,
+            "new_tokens_lens": num_accepted_tokens,
+            "next_draft_tokens": next_draft_tokens,
+            "next_new_tokens": next_new_tokens,
+        }
+        _publish_policy_window_output(
+            outputs,
+            None,
+            num_contexts=num_contexts,
+            num_generations=num_gens,
+            output_verify_lens=self._output_verify_lens,
+        )
+        return outputs
+
     def _forward_impl(
         self,
         input_ids,
@@ -1029,6 +1476,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
         draft_model,
         resource_manager=None,
     ):
+        if self._parallel.enabled:
+            return self._forward_impl_parallel(
+                input_ids, position_ids, logits, attn_metadata, spec_metadata, draft_model
+            )
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts

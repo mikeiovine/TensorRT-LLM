@@ -1932,6 +1932,14 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                            and attn_metadata.num_contexts == 0)
         if hoist_positions:
             position_ids = position_ids.contiguous()
+        # Parallel drafting (DSpark, experimental): the next step's draft is
+        # enqueued before the target so it can run alongside it; the worker
+        # joins and commits it after verification.
+        launch_parallel_draft = getattr(self.spec_worker, "launch_parallel_draft",
+                                        None)
+        if launch_parallel_draft is not None and spec_metadata is not None:
+            launch_parallel_draft(input_ids, position_ids, attn_metadata,
+                                  spec_metadata, self.draft_model)
         hidden_states = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,

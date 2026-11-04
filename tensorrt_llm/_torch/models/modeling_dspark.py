@@ -83,7 +83,7 @@ import math
 import os
 import re
 from functools import lru_cache
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Any, Callable, Dict, List, NamedTuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -109,6 +109,7 @@ from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mhc.hyper_connection import HCHead
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import MINIMAX_DSPARK_DRAFT_ARCH, is_mla
+from ..speculative.dspark_parallel import DSparkParallelDraftConfig, parallel_draft_requested
 from ..speculative.interface import SpeculativeDecodingMode
 from ..speculative.spec_tail_kernels import DraftBlockPlacement
 from ..speculative.vocab_parallel import markov_chain_logits
@@ -312,6 +313,59 @@ def get_dspark_topk_idxs_batched(
     blk_idx = window_size + torch.arange(block_size, device=device)  # [block]
     blk_idx = blk_idx.unsqueeze(0).expand(g, -1)  # [G, block]
     row = torch.cat([ctx_idx, blk_idx], dim=1).to(torch.int32)  # [G, win+block]
+    return row.unsqueeze(1).expand(g, block_size, -1).contiguous()
+
+
+def get_dspark_topk_idxs_parallel(
+    window_size: int,
+    block_size: int,
+    ctx_end: torch.Tensor,
+    num_ctx: torch.Tensor,
+    extra_valid: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Attended-position indices for a parallel (in-flight) DSpark draft.
+
+    Like :func:`get_dspark_topk_idxs_batched`, but the context suffix ends at
+    the last *verified* frame ``ctx_end`` rather than at the draft's own start
+    position, and optional stand-in entries for in-flight frames sit between
+    the window and the block in the concatenated K/V.
+
+    Args:
+        window_size: sliding-window length of the captured-context KV cache.
+        block_size: number of draft positions per request.
+        ctx_end: ``[G]`` last verified window frame per request.
+        num_ctx: ``[G]`` number of verified frames ending at ``ctx_end`` to attend.
+        extra_valid: optional ``[G, E]`` mask of usable stand-in entries.
+
+    Returns:
+        int32 tensor ``[G, block_size, window_size + E + block_size]``.
+    """
+    device = ctx_end.device
+    g = ctx_end.shape[0]
+    ctx_cols = torch.arange(window_size, device=device)
+    age = torch.remainder(ctx_end.unsqueeze(1) - ctx_cols.unsqueeze(0), window_size)
+    valid = age < num_ctx.clamp(min=0, max=window_size).unsqueeze(1)
+    pieces = [
+        torch.where(
+            valid,
+            ctx_cols.unsqueeze(0).expand(g, -1),
+            torch.full_like(valid, -1, dtype=torch.long),
+        )
+    ]
+    num_extra = 0
+    if extra_valid is not None:
+        num_extra = extra_valid.shape[1]
+        extra_cols = window_size + torch.arange(num_extra, device=device)
+        pieces.append(
+            torch.where(
+                extra_valid,
+                extra_cols.unsqueeze(0).expand(g, -1),
+                torch.full_like(extra_valid, -1, dtype=torch.long),
+            )
+        )
+    blk_idx = window_size + num_extra + torch.arange(block_size, device=device)
+    pieces.append(blk_idx.unsqueeze(0).expand(g, -1))
+    row = torch.cat(pieces, dim=1).to(torch.int32)
     return row.unsqueeze(1).expand(g, block_size, -1).contiguous()
 
 
@@ -745,6 +799,118 @@ def dspark_attention_forward_batched(
     wo_a_v = wo_a.view(n_groups, o_lora_rank, -1)
     o = torch.einsum("bsgd,grd->bsgr", o, wo_a_v)
     return F.linear(o.flatten(2), wo_b)
+
+
+def dspark_attention_forward_parallel(
+    x: torch.Tensor,
+    start_pos: torch.Tensor,
+    ctx_end: torch.Tensor,
+    num_ctx: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slots: torch.Tensor,
+    extra_kv: torch.Tensor | None = None,
+    extra_valid: torch.Tensor | None = None,
+    *,
+    wq_a: torch.Tensor,
+    q_norm_w: torch.Tensor,
+    wq_b: torch.Tensor,
+    wkv: torch.Tensor,
+    kv_norm_w: torch.Tensor,
+    wo_a: torch.Tensor,
+    wo_b: torch.Tensor,
+    attn_sink: torch.Tensor,
+    n_heads: int,
+    head_dim: int,
+    rope_head_dim: int,
+    n_groups: int,
+    o_lora_rank: int,
+    window_size: int,
+    eps: float,
+    softmax_scale: float,
+    freqs_cis: torch.Tensor,
+    q_b_norm_enabled: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Captured-context DSpark attention for a draft launched before verification.
+
+    Same per-position math as the reference (unfused) branch of
+    :func:`dspark_attention_forward_batched`, with three differences that let
+    it run concurrently with the target forward:
+
+    * no ``main_kv`` is written: the window is read-only and holds verified
+      frames only, the last of which is ``ctx_end`` (the sequential draft
+      writes the frame at ``start_pos`` just in time instead);
+    * in-flight frames between ``ctx_end`` and ``start_pos`` can be stood in
+      for by ``extra_kv`` entries (already RMS-normalized and rotated at their
+      own frames), selected by ``extra_valid``;
+    * the block's own K/V are returned so the caller can stash them as the
+      next draft's stand-ins.
+
+    With ``ctx_end == start_pos`` and no stand-ins this equals the sequential
+    draft once its ``main_kv`` sits in the window.
+
+    Args:
+        x: ``[G, block, dim]`` block layer input.
+        start_pos: ``[G]`` frame preceding the block (the anchor's position);
+            block slot ``i`` sits at frame ``start_pos + 1 + i``.
+        ctx_end: ``[G]`` last verified window frame.
+        num_ctx: ``[G]`` verified frames ending at ``ctx_end`` to attend.
+        kv_cache: ``[N, window_size, head_dim]`` rolling windows (read only).
+        slots: ``[G]`` row of each request in ``kv_cache``.
+        extra_kv: optional ``[G, E, head_dim]`` in-flight stand-ins.
+        extra_valid: ``[G, E]`` bool, required with ``extra_kv``.
+
+    Returns:
+        ``(out [G, block, dim], block_kv [G, block, head_dim])``.
+    """
+    g, block, _ = x.shape
+    if kv_cache.shape[1] != window_size:
+        raise ValueError(
+            f"kv_cache window extent {kv_cache.shape[1]} does not match window_size {window_size}"
+        )
+    if (extra_kv is None) != (extra_valid is None):
+        raise ValueError("extra_kv and extra_valid must be passed together")
+    rd = rope_head_dim
+    blk_pos = start_pos.unsqueeze(1) + 1 + torch.arange(block, device=x.device)  # [G, block]
+    blk_freqs = freqs_cis[blk_pos]  # [G, block, rd//2]
+
+    q = _rmsnorm_rope_batched(F.linear(x, wq_a), q_norm_w, eps, 0, blk_freqs)
+    q = F.linear(q, wq_b).unflatten(-1, (n_heads, head_dim))  # [G, block, h, head_dim]
+    q = _rmsnorm_rope_batched(
+        q,
+        None,
+        eps,
+        rd,
+        blk_freqs,
+        num_heads=n_heads,
+        apply_weight=False,
+        apply_rmsnorm=q_b_norm_enabled,
+    )
+    block_kv = _rmsnorm_rope_batched(F.linear(x, wkv), kv_norm_w, eps, rd, blk_freqs)
+
+    cache_rows = kv_cache[slots]  # [G, window, head_dim]
+    pieces = [cache_rows]
+    if extra_kv is not None:
+        pieces.append(extra_kv.to(cache_rows.dtype))
+    pieces.append(block_kv.to(cache_rows.dtype))
+    kv_full = torch.cat(pieces, dim=1)
+    topk = get_dspark_topk_idxs_parallel(window_size, block, ctx_end, num_ctx, extra_valid)
+    o = dspark_sparse_attn(q, kv_full, attn_sink, topk, softmax_scale)  # [G, block, h, head_dim]
+    o = _rmsnorm_rope_batched(
+        o,
+        kv_norm_w,
+        eps,
+        rd,
+        blk_freqs,
+        num_heads=n_heads,
+        apply_weight=False,
+        apply_rmsnorm=False,
+        inverse_rope=True,
+    )
+
+    o = o.reshape(g, block, n_groups, -1)
+    wo_a_v = wo_a.view(n_groups, o_lora_rank, -1)
+    o = torch.einsum("bsgd,grd->bsgr", o, wo_a_v)
+    return F.linear(o.flatten(2), wo_b), block_kv
 
 
 # ----------------------------------------------------------------------------
@@ -1674,6 +1840,7 @@ class DSv4DSparkDraftModel(nn.Module):
         valid_len: Optional[torch.Tensor] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         pre_mix: Optional[torch.Tensor] = None,
+        attn_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """One DSpark stage = reference ``Block.forward`` with captured-context attn.
 
@@ -1693,6 +1860,10 @@ class DSv4DSparkDraftModel(nn.Module):
         attention (:func:`dspark_attention_forward_batched`) is used instead: it
         takes ``start_pos`` as a ``[G]`` tensor and writes/reads ``stage_window``
         (then shaped ``[N, window_size, head_dim]``) through the ``slots`` index.
+
+        ``attn_fn``, when given, replaces the captured-context attention: it maps
+        the normalized ``[T, block, hidden]`` layer input to the attention output
+        (the parallel draft path supplies its own read-only attention this way).
         """
         T, block, _, hidden = h.shape
 
@@ -1710,7 +1881,7 @@ class DSv4DSparkDraftModel(nn.Module):
         persist = stage_window is not None
         kv_cache = (
             stage_window
-            if persist
+            if persist or attn_fn is not None
             else torch.zeros(
                 T,
                 self._attn_params["window_size"],
@@ -1719,7 +1890,9 @@ class DSv4DSparkDraftModel(nn.Module):
                 device=h.device,
             )
         )
-        if slots is not None:
+        if attn_fn is not None:
+            attn = attn_fn(layer_input)
+        elif slots is not None:
             # Batched, CUDA-graph-safe path (start_pos is a [G] tensor; window is
             # written/read through ``slots``).
             attn = dspark_attention_forward_batched(
@@ -1954,6 +2127,93 @@ class DSv4DSparkDraftModel(nn.Module):
             pre_mix=pre_mix,
         )
 
+    def forward_parallel(
+        self,
+        anchor_ids: torch.Tensor,
+        start_pos: torch.Tensor,
+        ctx_end: torch.Tensor,
+        num_ctx: torch.Tensor,
+        *,
+        kv_windows: torch.Tensor,
+        slots: torch.Tensor,
+        extra_kv: Optional[torch.Tensor] = None,
+        extra_valid: Optional[torch.Tensor] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Greedy block draft that reads, but never writes, the rolling windows.
+
+        Used by parallel drafting, where the draft runs before (or alongside)
+        the target forward that produces the hidden states for the tokens in
+        flight. The block input is ``[anchor, noise, ...]`` as usual; attention
+        sees verified window frames up to ``ctx_end`` plus optional stand-ins
+        for in-flight frames (see :func:`dspark_attention_forward_parallel`).
+
+        Args:
+            anchor_ids: ``[G]`` token the block continues from.
+            start_pos: ``[G]`` the anchor's position (block slot ``i`` sits at
+                frame ``start_pos + 1 + i``).
+            ctx_end: ``[G]`` last verified window frame.
+            num_ctx: ``[G]`` verified frames to attend, ending at ``ctx_end``.
+            kv_windows: ``[N, num_stages, window_size, head_dim]`` windows.
+            slots: ``[G]`` row of each request in ``kv_windows``.
+            extra_kv: optional ``[G, num_stages, E, head_dim]`` stand-ins.
+            extra_valid: ``[G, E]`` mask of usable stand-ins.
+
+        Returns:
+            ``(draft_tokens [G, block], block_kv [G, num_stages, block, head_dim])``.
+        """
+        if getattr(self.mtp_layers[0], "_dspark_attn", None) is None:
+            raise RuntimeError(
+                "DSpark attention weights not cached; call "
+                "cache_attn_weights_from_checkpoint(ckpt_dir, weight_map) after loading."
+            )
+        draft_ids = build_draft_input_ids(
+            anchor_ids, block_size=self.block_size, noise_token_id=self.noise_token_id
+        )
+        x = self.embed_tokens(draft_ids).unsqueeze(-2).repeat(1, 1, self.hc_mult, 1)
+        freqs_cis = self._dspark_freqs_table(x.device)
+        moe_input_ids = draft_ids.reshape(-1)
+        block_kvs: List[torch.Tensor] = []
+
+        h = x
+        pre_mix = self._initial_pre_mix(x)
+        for s, stage in enumerate(self.mtp_layers):
+            stage_extra = extra_kv[:, s] if extra_kv is not None else None
+
+            def attn_fn(layer_input, stage=stage, stage_window=kv_windows[:, s], ex=stage_extra):
+                out, block_kv = dspark_attention_forward_parallel(
+                    layer_input,
+                    start_pos,
+                    ctx_end,
+                    num_ctx,
+                    stage_window,
+                    slots,
+                    ex,
+                    extra_valid if ex is not None else None,
+                    freqs_cis=freqs_cis,
+                    **stage._dspark_attn,
+                    **self._attn_params,
+                )
+                block_kvs.append(block_kv)
+                return out
+
+            h = self._forward_stage(
+                stage,
+                h,
+                None,
+                start_pos,
+                freqs_cis,
+                moe_input_ids,
+                all_rank_num_tokens=all_rank_num_tokens,
+                pre_mix=pre_mix,
+                attn_fn=attn_fn,
+            )
+            if self.uses_lagged_pre:
+                h, pre_mix = h
+
+        draft_tokens, _ = self.forward_head(h, anchor_ids, temperature=0.0, pre_mix=pre_mix)
+        return draft_tokens, torch.stack(block_kvs, dim=1)
+
     def _initial_pre_mix(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
         """V4.1 seeds the lagged input mix with a one-hot on residual stream 0."""
         if not self.uses_lagged_pre:
@@ -2105,6 +2365,10 @@ class DSv4DSparkForCausalLM(nn.Module):
         """CUDA-graph-safe batched draft forward (delegates to the draft model)."""
         return self.dspark_model.forward_batched(main_hidden, bonus_token_ids, start_pos, **kwargs)
 
+    def forward_parallel(self, anchor_ids, start_pos, ctx_end, num_ctx, **kwargs):
+        """Window-read-only draft for parallel drafting (delegates to the draft model)."""
+        return self.dspark_model.forward_parallel(anchor_ids, start_pos, ctx_end, num_ctx, **kwargs)
+
     def run_moe_lockstep_noop(self, all_rank_num_tokens, device):
         """Empty-batch MoE barrier lockstep (delegates to the draft model)."""
         return self.dspark_model.run_moe_lockstep_noop(all_rank_num_tokens, device)
@@ -2163,12 +2427,59 @@ class DSv4DSparkForCausalLM(nn.Module):
         logger.info("[DSpark] draft weight load complete")
 
     def load_weights_from_target_model(self, target_model):
-        """Share the target's embed_tokens / lm_head (DSpark has neither)."""
+        """Share the target's embed_tokens / lm_head (DSpark has neither).
+
+        A drafter replicated for parallel drafting must not issue collectives,
+        so it gets a private full-vocabulary copy of a vocab-sharded head.
+        """
         if self.dspark_model.embed_tokens is None:
             self.dspark_model.embed_tokens = target_model.model.embed_tokens
         if self.lm_head is None:
-            self.lm_head = target_model.lm_head
-            self.dspark_model.lm_head = target_model.lm_head
+            lm_head = target_model.lm_head
+            if getattr(self, "replicated_for_parallel_draft", False):
+                lm_head = _ReplicatedLMHead.from_target_head(lm_head, self.config.vocab_size)
+            self.lm_head = lm_head
+            self.dspark_model.lm_head = lm_head
+
+
+class _ReplicatedLMHead(nn.Module):
+    """Rank-local full-vocabulary LM head: no collectives in its forward.
+
+    Built once at load from the target's head. A column-parallel head is
+    all-gathered across its TP group here, eagerly, before any CUDA graph is
+    captured; afterwards the draft computes full logits on every rank.
+    """
+
+    def __init__(self, weight: torch.Tensor, vocab_size: int):
+        super().__init__()
+        self.register_buffer("weight", weight, persistent=False)
+        self.vocab_size = int(vocab_size)
+
+    @classmethod
+    def from_target_head(cls, head: nn.Module, vocab_size: int) -> "_ReplicatedLMHead":
+        if getattr(head, "has_any_quant", False):
+            raise NotImplementedError("Parallel DSpark drafting cannot replicate a quantized LM head")
+        weight = head.weight
+        tp_size = int(getattr(head, "tp_size", 1) or 1)
+        tp_mode = getattr(head, "tp_mode", None)
+        if tp_size > 1 and tp_mode == TensorParallelMode.COLUMN:
+            from ..distributed import allgather
+
+            with torch.inference_mode():
+                weight = allgather(weight.detach().contiguous(), head.mapping, dim=0)
+        elif tp_size > 1 and tp_mode is not None:
+            raise NotImplementedError(
+                f"Parallel DSpark drafting cannot replicate an LM head sharded with {tp_mode}"
+            )
+        if weight.shape[0] < vocab_size:
+            raise ValueError(
+                f"Replicated DSpark LM head has {weight.shape[0]} rows, fewer than the "
+                f"vocabulary size {vocab_size}"
+            )
+        return cls(weight[:vocab_size].detach().clone(), vocab_size)
+
+    def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
+        return F.linear(hidden_states, self.weight)
 
 
 # ----------------------------------------------------------------------------
@@ -3912,6 +4223,53 @@ def draft_is_embedded_in_target(model_config) -> bool:
     return bool(model_config.spec_config.draft_is_embedded_in_target)
 
 
+def _replicate_dspark_draft_for_parallel_drafting(draft_config, aux_stream_dict):
+    """Single-rank draft config and private aux streams for a replicated drafter.
+
+    Parallel drafting overlaps the draft with the target forward. A sharded
+    draft's MoE all-reduce and head all-gather would then run concurrently
+    with the target's collectives on the same communicators and workspaces,
+    so each rank instead builds the whole drafter (every draft expert) with a
+    world-size-1 mapping. Private aux streams keep the draft's internal
+    stream overlap from serializing against the target's.
+    """
+    if _active_moe_load_balancer() is not None:
+        raise NotImplementedError(
+            "Parallel DSpark drafting with a replicated drafter does not support EPLB: "
+            "the replicated draft experts are not part of the target's expert placement."
+        )
+    mapping = draft_config.mapping
+    local_mapping = Mapping(
+        world_size=1,
+        rank=0,
+        gpus_per_node=mapping.gpus_per_node,
+        tp_size=1,
+        pp_size=1,
+        moe_tp_size=1,
+        moe_ep_size=1,
+    )
+    replicated = copy.copy(draft_config)
+    # ModelConfig is a frozen dataclass; bypass the guard as
+    # _derive_draft_model_config does.
+    object.__setattr__(replicated, "mapping", local_mapping)
+    object.__setattr__(replicated, "moe_load_balancer", None)
+    logger.info(
+        "DSpark parallel drafting: building a replicated drafter on every rank "
+        f"(target mapping tp={mapping.tp_size}, moe_ep={mapping.moe_ep_size}, "
+        f"attention_dp={mapping.enable_attention_dp})"
+    )
+
+    private_streams = None
+    if aux_stream_dict:
+        by_id: Dict[int, torch.cuda.Stream] = {}
+        private_streams = {}
+        for key, stream in aux_stream_dict.items():
+            if id(stream) not in by_id:
+                by_id[id(stream)] = torch.cuda.Stream()
+            private_streams[key] = by_id[id(stream)]
+    return replicated, private_streams
+
+
 @register_draft_model(SpeculativeDecodingMode.DSPARK)
 def _build_dspark_draft(model_config, draft_config, lm_head, model):
     """Build the DSpark drafter for either flavour.
@@ -3935,19 +4293,31 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
     """
     if draft_is_embedded_in_target(model_config):
         num_stages = count_dspark_stages(model_config.spec_config.speculative_model)
-        validate_dspark_eplb_layer_base(model_config, draft_config)
+        aux_stream_dict = getattr(model, "aux_stream_dict", None)
+        replicate = (
+            parallel_draft_requested()
+            and DSparkParallelDraftConfig.from_env(model_config.mapping.world_size).replicate
+        )
+        if replicate:
+            draft_config, aux_stream_dict = _replicate_dspark_draft_for_parallel_drafting(
+                draft_config, aux_stream_dict
+            )
+        else:
+            validate_dspark_eplb_layer_base(model_config, draft_config)
         draft_cls = DSv4DSparkForCausalLM
         if draft_config.pretrained_config.model_type in ("deepseek_v41", "deepseek_v41_text"):
             from .modeling_dspark_v41 import DSv41DSparkForCausalLM
 
             draft_cls = DSv41DSparkForCausalLM
-        return draft_cls(
+        draft = draft_cls(
             draft_config,
-            getattr(model, "aux_stream_dict", None),
+            aux_stream_dict,
             num_stages=num_stages,
             block_size=model_config.spec_config.block_size,
             draft_moe_backend=getattr(model_config.spec_config, "moe_backend", None),
         )
+        draft.replicated_for_parallel_draft = replicate
+        return draft
 
     # Dispatch on the attention shape, not on model_type: the block decode is
     # what differs between the two wrappers, and everything below it
