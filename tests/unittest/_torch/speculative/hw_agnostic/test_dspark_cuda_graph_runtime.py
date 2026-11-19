@@ -330,6 +330,21 @@ def test_decoder_selects_confidence_graph_subclass_only_when_enabled(
 
 
 @pytest.mark.parametrize("runner_type", [CUDAGraphRunner, DSparkCUDAGraphRunner])
+def test_pad_batch_takes_the_sampling_mode_of_the_padding_exchange(runner_type):
+    runner = _runner_stub(runner_type)
+    runner.adp_shape_agreement = object()
+    runner._get_padded_batch = Mock(return_value=0)
+    batch, resources = object(), object()
+
+    with runner.pad_batch(batch, resources, 3, 2) as padded:
+        assert padded is batch
+
+    runner._get_padded_batch.assert_called_once_with(batch, resources, 3, 2)
+    if runner_type is DSparkCUDAGraphRunner:
+        assert runner.adp_shape_agreement is None
+
+
+@pytest.mark.parametrize("runner_type", [CUDAGraphRunner, DSparkCUDAGraphRunner])
 def test_reset_padding_dummies_clears_only_runner_owned_state(runner_type):
     runner = _runner_stub(runner_type)
     runner.padding_dummy_requests = {5: object()}
