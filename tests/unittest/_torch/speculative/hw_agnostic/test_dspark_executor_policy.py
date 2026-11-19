@@ -442,6 +442,27 @@ def test_no_compact_budget_clears_state_but_stages_the_next_confidence(monkeypat
     worker.bump_draft_seq.assert_not_called()
 
 
+def test_staging_confidence_advances_the_draft_sequence_and_the_acceptance_estimator():
+    from unittest.mock import Mock, call
+
+    buffer = object()
+    calls = Mock()
+    worker = SimpleNamespace(
+        staged_confidence_buffer=Mock(return_value=buffer),
+        bump_draft_seq=calls.bump_draft_seq,
+        advance_acceptance_estimator=calls.advance_acceptance_estimator,
+    )
+    planner = SimpleNamespace(stage_confidence=calls.stage_confidence)
+
+    PyExecutor._stage_dspark_confidence(SimpleNamespace(), worker, planner)
+
+    assert calls.mock_calls == [
+        call.bump_draft_seq(),
+        call.advance_acceptance_estimator(),
+        call.stage_confidence(buffer),
+    ]
+
+
 @pytest.mark.parametrize("mismatch", ["bucket", "graph_batch_size"])
 def test_policy_rejects_a_fitted_key_different_from_the_agreed_exact_cell(monkeypatch, mismatch):
     from tensorrt_llm._torch.pyexecutor import py_executor

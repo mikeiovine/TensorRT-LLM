@@ -6978,6 +6978,37 @@ class TestDSparkConfidenceScheduling:
         assert c.max_total_draft_tokens == 1
         assert c.tokens_per_gen_step == 2
 
+    def test_mtp_accepts_confidence_scheduling_with_a_cost_table(self):
+        c = MTPDecodingConfig(max_draft_len=3,
+                              enable_confidence_scheduling=True,
+                              confidence_cost_table_path="/tmp/costs.json")
+
+        assert c.enable_confidence_scheduling is True
+        assert c.enable_fused_confidence_scheduler is True
+
+    def test_mtp_single_draft_token_turns_confidence_scheduling_off(self):
+        c = MTPDecodingConfig(max_draft_len=1,
+                              enable_confidence_scheduling=True)
+
+        assert c.enable_confidence_scheduling is False
+
+    @pytest.mark.parametrize("overrides, message", [
+        (dict(), "requires confidence_cost_table_path"),
+        (dict(confidence_cost_table_path="/tmp/costs.json",
+              draft_len_schedule={4: 3}), "draft_len_schedule or max_concurrency"),
+        (dict(confidence_cost_table_path="/tmp/costs.json",
+              use_mtp_vanilla=True), "use_mtp_vanilla is not supported"),
+        (dict(confidence_cost_table_path="/tmp/costs.json",
+              use_relaxed_acceptance_for_thinking=True),
+         "use_relaxed_acceptance_for_thinking is not supported"),
+    ])
+    def test_mtp_confidence_scheduling_rejects_unsupported_settings(
+            self, overrides, message):
+        with pytest.raises(ValueError, match=message):
+            MTPDecodingConfig(max_draft_len=3,
+                              enable_confidence_scheduling=True,
+                              **overrides)
+
     def test_physical_k1_remains_valid_when_scheduling_is_off(self):
         c = self._cfg(max_draft_len=1)
         assert c.enable_confidence_scheduling is False

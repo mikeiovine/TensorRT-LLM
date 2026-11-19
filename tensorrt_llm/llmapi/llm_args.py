@@ -3999,6 +3999,51 @@ class MTPDecodingConfig(DecodingBaseConfig):
         "is enabled. Required when use_dynamic_tree is True; ignored (with a "
         "warning) when use_dynamic_tree is False.")
 
+    enable_confidence_scheduling: bool = Field(
+        default=False,
+        description=
+        "Enable confidence-guided selection of a measured verifier-token budget "
+        "for decode-only batches. Every draft token is still proposed; target "
+        "verification and acceptance rules are unchanged. Per-position "
+        "acceptance is predicted by a logistic model of the draft logits that "
+        "is fitted online from the target's verdicts. Requires a cost table "
+        "(confidence_cost_table_path), a single-layer MTP checkpoint served "
+        "with a linear draft chain, and a target whose attention backend "
+        "verifies a different number of tokens per request (DeepSeek-V4). "
+        "Native verification is kept whenever no compact budget is predicted "
+        "to win by confidence_min_predicted_gain.",
+        status="prototype")
+
+    confidence_cost_table_path: Optional[str] = Field(
+        default=None,
+        description=
+        "Path to a cost table: measured decode step times per max_draft_len, "
+        "rank-local CUDA-graph batch size and verifier-token budget. One file "
+        "may hold several draft lengths; the entry for max_draft_len is used. "
+        "Generate one with `python -m tensorrt_llm.tools.dspark_profile_costs`. "
+        "Required when enable_confidence_scheduling=True.",
+        status="prototype")
+
+    confidence_min_predicted_gain: NonNegativeFloat = Field(
+        default=0.04,
+        description=
+        "Minimum predicted relative goodput gain (expected accepted tokens per "
+        "millisecond) a compact verifier budget needs over native "
+        "verification before it is selected. Larger values keep native "
+        "verification more often.",
+        status="prototype")
+
+    enable_fused_confidence_scheduler: bool = Field(
+        default=True,
+        description=
+        "Re-rank which draft positions are verified on the GPU, using the "
+        "confidence of the block being verified rather than the previous "
+        "step's host copy. The verifier budget is still chosen on the host. "
+        "Only used when enable_confidence_scheduling=True and the overlap "
+        "scheduler is on; with disable_overlap_scheduler=True, ranking stays "
+        "on the host.",
+        status="prototype")
+
     draft_lm_head_dtype: Literal["auto", "mxfp8"] = Field(
         default="auto",
         status="prototype",
@@ -4106,6 +4151,49 @@ class MTPDecodingConfig(DecodingBaseConfig):
                     f"max_draft_len ({default_max_total_draft_tokens})]")
         elif self.max_draft_len is not None:
             self.max_total_draft_tokens = self.max_draft_len  # linear chain
+        return self
+
+    @model_validator(mode="after")
+    def validate_confidence_scheduling(self) -> "MTPDecodingConfig":
+        if not self.enable_confidence_scheduling:
+            return self
+        if self.max_draft_len == 1:
+            # One draft token has no shorter verification window.
+            logger.warning(
+                "MTP confidence scheduling has no compact tier below "
+                "max_draft_len=1; using native verification.")
+            self.enable_confidence_scheduling = False
+            return self
+        if (self.draft_len_schedule is not None
+                or self.max_concurrency is not None):
+            raise ValueError(
+                "MTP confidence scheduling cannot be combined with "
+                "draft_len_schedule or max_concurrency: each one selects how "
+                "many draft tokens a step verifies. Unset them or disable "
+                "confidence scheduling.")
+        if not self.confidence_cost_table_path:
+            raise ValueError(
+                "MTP confidence scheduling requires confidence_cost_table_path. "
+                "Generate a cost table with `python -m "
+                "tensorrt_llm.tools.dspark_profile_costs`.")
+        # The scheduled drafts and their acceptance each assume one layout of
+        # the verified rows that these options replace.
+        unsupported = [
+            name for name, value in (
+                ("use_mtp_vanilla", self.use_mtp_vanilla),
+                ("use_dynamic_tree", self.use_dynamic_tree),
+                ("use_relaxed_acceptance_for_thinking",
+                 self.use_relaxed_acceptance_for_thinking),
+                ("sa_config", self.sa_config is not None),
+            ) if value
+        ]
+        if unsupported:
+            raise ValueError(
+                f"{' and '.join(unsupported)} is not supported with "
+                "enable_confidence_scheduling=True.")
+        # Confidence scheduling admits greedy requests only under rejection
+        # sampling, so none of these options would ever act.
+        self._reject_rejection_options_with("enable_confidence_scheduling")
         return self
 
     def supports_backend(self, backend: str) -> bool:
@@ -4623,8 +4711,11 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "Enable confidence-guided selection of a measured verifier-token budget "
         "for decode-only batches. The full physical draft block is still "
         "proposed; target verification and acceptance rules are unchanged. "
-        "Requires trained confidence-head weights and a cost table "
-        "(confidence_cost_table_path). Native verification is kept whenever no "
+        "Requires a cost table (confidence_cost_table_path). Per-position "
+        "acceptance comes from the checkpoint's trained confidence head; a "
+        "checkpoint without one is scored by a logistic model of the draft "
+        "logits that is fitted online from the target's verdicts. Native "
+        "verification is kept whenever no "
         "compact budget is predicted to win by confidence_min_predicted_gain.",
         status="prototype")
 
@@ -9285,12 +9376,13 @@ class TorchLlmArgs(BaseLlmArgs):
         ragged path at all or takes it with a kernel that mis-attributes rows.
         A hard error at construction is the only signal that survives.
         """
-        if not self.speculative_config.draft_is_embedded_in_target:
+        speculative_config = self.speculative_config
+        # MTP layers always live in the target checkpoint.
+        if not getattr(speculative_config, "draft_is_embedded_in_target", True):
             raise ValueError(
                 "DSpark confidence scheduling supports only the embedded "
                 "DeepSeek-V4 draft. Standalone DSpark retains native "
                 "verification; disable confidence scheduling for that path.")
-        speculative_config = self.speculative_config
         if (getattr(speculative_config, "acceptance_rate_window_size", None)
                 and getattr(speculative_config, "acceptance_rate_threshold",
                             None) is not None):
@@ -9901,6 +9993,10 @@ class TorchLlmArgs(BaseLlmArgs):
                 spec_cfg.resolve_context_recompute_tail(self.trust_remote_code)
                 if spec_cfg.enable_confidence_scheduling:
                     self._validate_dspark_confidence_environment()
+
+            if (isinstance(self.speculative_config, MTPDecodingConfig)
+                    and self.speculative_config.enable_confidence_scheduling):
+                self._validate_dspark_confidence_environment()
 
             if isinstance(self.speculative_config, SADecodingConfig):
                 pool_size = self.speculative_config.global_pool_size

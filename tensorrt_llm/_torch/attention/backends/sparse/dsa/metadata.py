@@ -2139,6 +2139,22 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         )
         return self.row_kv_lens_cuda[:num_tokens]
 
+    def suspend_ragged_verification(self) -> tuple:
+        """Leave the per-request layout for passes that submit one token per request.
+
+        A one-model drafter runs its first pass over the verified windows and
+        every later pass over one token per request. Returns the state for
+        :meth:`resume_ragged_verification`.
+        """
+        saved = (self.ragged_verify_lens, self.use_expanded_buffers_for_mtp)
+        self.ragged_verify_lens = None
+        # The expanded buffers hold the rows of the verified windows.
+        self.use_expanded_buffers_for_mtp = False
+        return saved
+
+    def resume_ragged_verification(self, saved: tuple) -> None:
+        self.ragged_verify_lens, self.use_expanded_buffers_for_mtp = saved
+
     def apply_device_ragged_layout(
         self,
         verify_lens: torch.Tensor,

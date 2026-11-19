@@ -15,6 +15,7 @@
 """CPU regression tests for the embedded worker's confidence-state contract."""
 
 import json
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -75,6 +76,7 @@ def _draft(
     offsets=None,
     accepted_counts=None,
     positions=None,
+    return_tokens=False,
 ):
     num_gens = len(accepted_counts) if accepted_counts is not None else 2
     accepted_counts = [1] * num_gens if accepted_counts is None else accepted_counts
@@ -96,6 +98,7 @@ def _draft(
         num_contexts + num_gens,
         len(captured),
         positions,
+        return_tokens=return_tokens,
     )
 
 
@@ -297,6 +300,173 @@ def test_calibration_shorter_than_k_is_rejected(tmp_path):
 
     with pytest.raises(ValueError, match="has 2 temperatures but the confidence head scores 3"):
         worker._build_verify_planner(model, block_size=3)
+
+
+def _headless_worker(num_rows=2):
+    """A worker whose checkpoint has no confidence head."""
+    worker = _worker(num_rows)
+    worker.spec_config.confidence_calibration_path = None
+    worker.spec_config.enable_fused_confidence_scheduler = False
+    worker._build_verify_planner(SimpleNamespace(), block_size=3)
+    return worker
+
+
+def _headless_draft_model(logits):
+    def forward(main_hidden, bonus, start_pos, **kwargs):
+        assert kwargs["return_confidence"] and kwargs["return_logits"]
+        return torch.zeros(logits.shape[:2], dtype=torch.long), None, logits
+
+    return SimpleNamespace(
+        block_size=3,
+        project_captured_rows=lambda captured, rows: captured[rows],
+        forward_batched=Mock(side_effect=forward),
+        write_context_windows_batched=Mock(),
+    )
+
+
+def _headless_step(worker, logits, *, lengths, accepted_counts, return_tokens=False):
+    offsets = [0]
+    for length in lengths:
+        offsets.append(offsets[-1] + length)
+    return _draft(
+        worker,
+        _headless_draft_model(logits),
+        torch.zeros(offsets[-1], 2),
+        lengths=lengths,
+        offsets=offsets,
+        accepted_counts=accepted_counts,
+        return_tokens=return_tokens,
+    )
+
+
+def test_checkpoint_without_a_confidence_head_gets_the_online_estimator():
+    worker = _headless_worker(1)
+
+    estimator = worker._acceptance_estimator
+    assert estimator.features.shape == worker._confidence_logits.shape
+    assert worker.verify_planner.apply_calibration is torch.sigmoid
+
+
+def test_trained_confidence_head_keeps_the_estimator_off():
+    worker = _worker(1)
+    worker.spec_config.confidence_calibration_path = None
+    worker.spec_config.enable_fused_confidence_scheduler = False
+    _, model = _model_with_head(block_size=3)
+
+    worker._build_verify_planner(model, block_size=3)
+    worker.advance_acceptance_estimator()
+
+    assert worker._acceptance_estimator is None
+
+
+@pytest.mark.parametrize("return_tokens", [False, True])
+def test_estimator_scores_the_drafted_block_into_the_confidence_buffer(return_tokens):
+    torch.manual_seed(0)
+    worker = _headless_worker(2)
+    worker.bump_draft_seq()
+    logits = torch.randn(2, 3, 16) * 4.0
+
+    output = _headless_step(
+        worker, logits, lengths=[4, 4], accepted_counts=[1, 1], return_tokens=return_tokens
+    )
+
+    assert output.dtype == (torch.int32 if return_tokens else logits.dtype)
+    probs = torch.softmax(logits.double(), dim=-1).amax(dim=-1)
+    expected = (0.5 * torch.log(probs / (1.0 - probs)) - 0.2).float()
+    torch.testing.assert_close(worker._confidence_logits[:2], expected, atol=1e-3, rtol=1e-3)
+    assert worker._confidence_stamp[:2].tolist() == [1, 1]
+    assert worker._confidence_logits[worker._scratch_slot + 1].tolist() == [30.0, 30.0, 30.0]
+    assert worker._acceptance_estimator.pending.tolist() == [True, True, False, False]
+
+
+def test_estimator_grades_the_verified_window_before_rescoring_it():
+    torch.manual_seed(0)
+    worker = _headless_worker(2)
+    estimator = worker._acceptance_estimator
+    first = torch.randn(2, 3, 16) * 4.0
+    second = torch.randn(2, 3, 16) * 4.0
+    # Neither request holds a scored block on its first generation step.
+    _headless_step(worker, first, lengths=[4, 4], accepted_counts=[1, 1])
+    assert not estimator.stats.any()
+    graded = estimator.predictions[:2].double().clone()
+
+    # Request 0 verifies two drafts and the second is rejected. Request 1
+    # verifies one draft, which is accepted: its window holds no rejection.
+    _headless_step(worker, second, lengths=[3, 2], accepted_counts=[2, 2])
+
+    assert estimator.stats[:, 5].tolist() == [2.0, 1.0, 0.0]
+    residuals = torch.stack(
+        [(1.0 - graded[0, 0]) + (1.0 - graded[1, 0]), 0.0 - graded[0, 1], torch.tensor(0.0)]
+    )
+    torch.testing.assert_close(estimator.stats[:, 4], residuals, atol=1e-6, rtol=1e-6)
+    probs = torch.softmax(second.double(), dim=-1).amax(dim=-1)
+    torch.testing.assert_close(
+        estimator.features[:2].double(), torch.log(probs / (1.0 - probs)), atol=1e-3, rtol=1e-3
+    )
+
+
+def test_graph_padding_rows_are_never_graded():
+    worker = _headless_worker(2)
+    worker._batch_to_slot[1] = worker._scratch_slot
+    logits = torch.randn(2, 3, 16)
+
+    _headless_step(worker, logits, lengths=[4, 4], accepted_counts=[1, 1])
+    _headless_step(worker, logits, lengths=[2, 2], accepted_counts=[2, 2])
+
+    assert worker._acceptance_estimator.stats[:, 5].tolist() == [1.0, 0.0, 0.0]
+
+
+def test_new_occupant_of_a_slot_is_not_graded_on_the_previous_block():
+    worker = _headless_worker(1)
+    worker._req_to_slot = {}
+    worker._free_slots = deque([0])
+    _headless_step(worker, torch.randn(1, 3, 16), lengths=[4], accepted_counts=[1])
+
+    assert worker._assign_slot(7, reset=False) == 0
+    _headless_step(worker, torch.randn(1, 3, 16), lengths=[4], accepted_counts=[3])
+
+    assert not worker._acceptance_estimator.stats.any()
+
+
+def test_warmup_restore_covers_the_estimator_state():
+    worker = _headless_worker(1)
+    estimator = worker._acceptance_estimator
+    _headless_step(worker, torch.randn(1, 3, 16), lengths=[4], accepted_counts=[1])
+    expected = estimator.snapshot()
+    saved = worker._snapshot_persistent_state()
+
+    _headless_step(worker, torch.randn(1, 3, 16), lengths=[4], accepted_counts=[2])
+    worker._restore_persistent_state(saved)
+
+    for tensor, value in zip(estimator.snapshot(), expected):
+        assert torch.equal(tensor, value)
+
+
+def test_a_step_without_drafting_drops_the_ungraded_blocks():
+    worker = _headless_worker(2)
+    estimator = worker._acceptance_estimator
+    _headless_step(worker, torch.randn(2, 3, 16), lengths=[4, 4], accepted_counts=[1, 1])
+    outputs = {
+        name: torch.zeros(2, 4, dtype=torch.int32)
+        for name in ("new_tokens", "next_draft_tokens", "next_new_tokens")
+    }
+    outputs["new_tokens_lens"] = torch.ones(2, dtype=torch.int32)
+    worker.skip_drafting = Mock(return_value=outputs)
+    worker._follow_target_step = Mock()
+
+    worker._forward_without_drafting(
+        torch.tensor([1, 2]),
+        torch.arange(2),
+        None,
+        torch.zeros(2, 4),
+        SimpleNamespace(num_seqs=2, num_contexts=0),
+        SimpleNamespace(),
+        _headless_draft_model(torch.zeros(2, 3, 16)),
+    )
+
+    worker._follow_target_step.assert_called_once()
+    assert not estimator.pending.any()
+    assert not estimator.stats.any()
 
 
 @pytest.mark.parametrize("bias", [False, True])

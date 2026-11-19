@@ -273,6 +273,14 @@ class MTPWorker(SpecWorkerBase):
         # plain TP + overlap scheduler.
         self.mapping = mapping if mapping is not None else getattr(
             model_config, "mapping", None)
+        if getattr(spec_config, "enable_confidence_scheduling", False):
+            # Known only once the checkpoint's MTP layer count is: this worker
+            # serves multi-layer checkpoints.
+            raise ValueError(
+                "MTP confidence scheduling supports single-layer MTP "
+                "checkpoints only; this checkpoint has "
+                f"{spec_config.num_nextn_predict_layers} MTP layers. Disable "
+                "enable_confidence_scheduling.")
         self.is_thop = False
         self._is_mamba_hybrid_cache = None
         self._row_pick = DraftRowPick("MTP layers")

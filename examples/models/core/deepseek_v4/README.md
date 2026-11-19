@@ -481,8 +481,10 @@ MoE backend (`moe_config.backend: CUTEDSL`, which `AUTO` selects under this over
 
 ## DSpark confidence scheduling (prototype)
 
-DSpark always drafts a block of `K` tokens. With confidence scheduling on, a trained confidence head
-scores each drafted position, and in decode-only steps the runtime may verify fewer than all
+DSpark always drafts a block of `K` tokens. With confidence scheduling on, each drafted position gets
+an acceptance probability (from a trained confidence head, or from an
+[online estimator](#checkpoints-without-a-confidence-head) when the checkpoint has none), and in
+decode-only steps the runtime may verify fewer than all
 `G * (K + 1)` rows (`G` = requests per rank, `V` = verified rows). It picks `V` from a **cost table**
 of measured step times, and only when the predicted accepted tokens per millisecond beat full
 verification by `confidence_min_predicted_gain`. Target verification and the acceptance rule are
@@ -542,6 +544,22 @@ A table from another TensorRT LLM version only warns. Tables in the earlier sing
 A vector longer than `K` is truncated, so one file fitted at the checkpoint's block size serves
 every `K`. Without it the raw sigmoid confidence is used.
 
+### Checkpoints without a confidence head
+
+A checkpoint without trained confidence-head weights needs no extra configuration. The runtime
+then predicts each position's acceptance probability from the draft logits:
+
+```text
+p_accept(k) = sigmoid(slope * logit(q_max) + intercept[k])
+```
+
+`q_max` is the probability the draft distribution gives its most likely token. The slope is shared
+by all draft positions and each position has its own intercept. Both are fitted while serving, from
+the target's accept and reject decisions on earlier drafts, and refreshed every 100 decode steps.
+Trimming starts with default coefficients and follows the workload after the first refits. Each
+rank fits its own coefficients. `confidence_calibration_path` applies to a trained head only and is
+rejected for these checkpoints.
+
 ### Device re-ranking
 
 The host chooses the verifier budget from a copy of the previous step's confidence, so it never
@@ -561,10 +579,22 @@ On DeepSeek-V4-Pro (8x B300) with attention DP, re-ranking raised throughput ove
 of its two losses (-2.2%) measured +0.4% when repeated on a later main. With TP8 attention and no
 attention DP it raised throughput in 14 of 16 settings at batch sizes 8 to 64, by up to 6.4%.
 
+### MTP
+
+`decoding_type: MTP` takes the same `enable_confidence_scheduling`, `confidence_cost_table_path`,
+`confidence_min_predicted_gain` and `enable_fused_confidence_scheduler` fields. MTP layers have no
+confidence head, so acceptance always comes from the
+[online estimator](#checkpoints-without-a-confidence-head). It needs a single-layer MTP checkpoint
+drafting a linear chain: `use_mtp_vanilla`, `use_dynamic_tree`,
+`use_relaxed_acceptance_for_thinking` and `sa_config` are rejected. Steps that verify fewer tokens
+than `max_draft_len` skip the fused first-draft-pass kernels, the MXFP8 draft head and the shared
+indexer selection, and every step computes full-vocabulary draft logits for the estimator.
+Generate the cost table with the MTP runtime YAML.
+
 ### Limitations
 
-Confidence scheduling requires the embedded DeepSeek-V4 DSpark drafter, padded CUDA graphs,
-PP=1 and CP=1. Guided decoding, LoRA, per-request logits post-processors, per-layer dynamic EPLB,
+Confidence scheduling requires a DeepSeek-V4 target with its embedded DSpark drafter or its MTP
+layer, padded CUDA graphs, PP=1 and CP=1. Guided decoding, LoRA, per-request logits post-processors, per-layer dynamic EPLB,
 heuristic sparse top-k, the acceptance-rate gate (`acceptance_rate_window_size` /
 `acceptance_rate_threshold`) and non-greedy rejection draft sampling are rejected.
 

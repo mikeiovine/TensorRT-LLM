@@ -159,8 +159,9 @@ def _profile_k(args) -> None:
     with open(args.config, encoding="utf-8") as file:
         config = yaml.safe_load(file) or {}
     spec = dict(config.get("speculative_config") or {})
-    if spec.get("decoding_type") != "DSpark":
-        raise ValueError("--config must use speculative_config.decoding_type: DSpark")
+    decoding_type = spec.get("decoding_type")
+    if decoding_type not in ("DSpark", "MTP"):
+        raise ValueError("--config must use speculative_config.decoding_type: DSpark or MTP")
     ladder = resolve_ladder(config, args.graph_batch_sizes)
     grid = plan_grid(ladder, k, args.tier_fractions)
 
@@ -186,11 +187,12 @@ def _profile_k(args) -> None:
     )
     spec.update(
         max_draft_len=k,
-        block_size=k,
         enable_confidence_scheduling=True,
         confidence_cost_table_path=str(grid_path),
         confidence_min_predicted_gain=0.0,
     )
+    if decoding_type == "DSpark":
+        spec["block_size"] = k
     config["speculative_config"] = spec
     config = without_adp_balance(config)
     if args.graph_batch_sizes:

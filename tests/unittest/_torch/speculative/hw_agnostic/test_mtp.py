@@ -1886,6 +1886,72 @@ def test_mtp_shared_kv_draft_inputs():
     )
 
 
+def _ragged_gen_metadata(verify_lens):
+    """Spec metadata of generation requests that verify windows of their own lengths."""
+    lens = torch.tensor(verify_lens, dtype=torch.int32)
+    return SimpleNamespace(
+        is_ragged_verify=True,
+        verify_lens=lens,
+        qo_indptr=torch.cat([lens.new_zeros(1), lens.cumsum(0)]).to(torch.int32),
+        total_verify_tokens=sum(verify_lens),
+        batch_indices_cuda=torch.arange(8, dtype=torch.int32),
+    )
+
+
+def test_mtp_eagle_ragged_step0_input_ids_follow_each_request_window():
+    accepted_tokens = torch.arange(12).reshape(3, 4) + 100
+
+    input_ids = MTPEagleWorker._ragged_generation_input_ids(
+        accepted_tokens, _ragged_gen_metadata([4, 2, 3])
+    )
+
+    assert input_ids.tolist() == [100, 101, 102, 103, 104, 105, 108, 109, 110]
+
+
+@pytest.mark.parametrize(
+    "verify_lens, expected_gen_rows",
+    [
+        # Rows start at each request's own offset: 0, 4 and 6.
+        ([4, 2, 3], [7 + 0 + 2, 7 + 4 + 1, 7 + 6 + 0]),
+        # Uniform windows of max_draft_len + 1 = 4 tokens.
+        (None, [7 + 0 + 2, 7 + 4 + 1, 7 + 8 + 0]),
+    ],
+)
+def test_mtp_eagle_step0_rows_are_the_last_accepted_row_of_each_request(
+    verify_lens, expected_gen_rows
+):
+    if verify_lens is None:
+        spec_metadata = SimpleNamespace(
+            is_ragged_verify=False, batch_indices_cuda=torch.arange(8, dtype=torch.int32)
+        )
+        gen_seq_lens = [4, 4, 4]
+    else:
+        spec_metadata = _ragged_gen_metadata(verify_lens)
+        gen_seq_lens = verify_lens
+
+    # Two context requests of 5 and 2 tokens precede the generation requests.
+    rows = MTPEagleWorker._step0_gather_ids(
+        torch.tensor([5, 2] + gen_seq_lens),
+        torch.tensor([1, 1, 3, 2, 1]),
+        spec_metadata,
+        num_contexts=2,
+        num_gens=3,
+        runtime_draft_len=3,
+        num_ctx_tokens=7,
+    )
+
+    assert rows.tolist() == [4, 6] + expected_gen_rows
+
+
+def test_vanilla_mtp_worker_rejects_confidence_scheduling():
+    spec_config = SimpleNamespace(
+        enable_confidence_scheduling=True, num_nextn_predict_layers=3, sa_config=None
+    )
+
+    with pytest.raises(ValueError, match="single-layer MTP checkpoints only"):
+        MTPWorker(spec_config)
+
+
 @pytest.mark.high_cuda_memory
 def test_vanilla_mtp_rejection():
     """Vanilla MTP with rejection sampling on: the per-step rejection path

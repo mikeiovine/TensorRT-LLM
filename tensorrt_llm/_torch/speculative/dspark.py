@@ -39,6 +39,7 @@ from ..distributed import AllReduceStrategy
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import do_multi_stream, private_stream
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
+from .acceptance_estimator import OnlineAcceptanceEstimator
 from .dflash import DFlashWorker, VocabParallelDraftTokens, dflash_draft_slot_ids
 from .dspark_schedule import NEUTRAL_CONFIDENCE_LOGIT
 from .interface import (
@@ -496,6 +497,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
     # derived weights cache_derived_state builds (set_draft_model).
     _forks_backfill = True
     _draft_model_ref: Optional[weakref.ref] = None
+    # Confidence source of a checkpoint without confidence-head weights, built
+    # with the verify planner; None when the trained head scores the block.
+    _acceptance_estimator: Optional[OnlineAcceptanceEstimator] = None
 
     def __init__(
         self,
@@ -599,6 +603,15 @@ class DSv4DSparkWorker(SpecWorkerBase):
         if self._draft_seq_cuda is not None:
             self._draft_seq_cuda.fill_(self._draft_seq_host)
         return prev
+
+    def advance_acceptance_estimator(self) -> None:
+        """Let the online acceptance estimator, if any, count one decode step.
+
+        Same call contract as :meth:`bump_draft_seq`: once per step from the
+        executor's host path, before the step's forward is enqueued.
+        """
+        if self._acceptance_estimator is not None:
+            self._acceptance_estimator.advance()
 
     def confidence_row_for(self, req_id: int) -> int:
         """Buffer row holding ``req_id``'s confidence, host-side.
@@ -927,24 +940,30 @@ class DSv4DSparkWorker(SpecWorkerBase):
         # graph ladder; the planner receives that runtime object before its
         # first decision.
 
-        # Calibration lives on the draft's confidence head; fall back to a plain
-        # sigmoid when the head is absent (no confidence to calibrate anyway).
+        # Calibration lives on the draft's confidence head. Without a head the
+        # online acceptance estimator writes the confidence logits, which are
+        # calibrated by its own fit and take a plain sigmoid.
         head = resolve_confidence_head(draft_model)
-        if head is None:
-            logger.warning(
-                "DSpark confidence scheduling is enabled, but the checkpoint has no "
-                "confidence-head weights; every step verifies the full draft block."
-            )
         apply_calibration = head.apply_sts if head is not None else None
         calibration_path = self.spec_config.confidence_calibration_path
         if calibration_path and head is None:
-            # Refuse rather than degrade: a configured calibration that cannot
-            # be attached is a wiring bug, never a preference.
+            # Refuse rather than ignore: the temperatures calibrate a trained
+            # head and have no meaning for the estimator.
             raise ValueError(
                 f"confidence_calibration_path is set but no confidence head was found "
-                f"on {type(draft_model).__name__}; calibration cannot be "
-                f"applied, so the planner would schedule on raw sigmoid "
-                f"survivals. This is a model-wiring bug, not a config choice."
+                f"on {type(draft_model).__name__}; the temperatures calibrate a "
+                f"trained confidence head, and without one the online acceptance "
+                f"estimator calibrates itself. Unset confidence_calibration_path."
+            )
+        if head is None:
+            self._acceptance_estimator = OnlineAcceptanceEstimator(
+                num_rows=self._confidence_logits.shape[0],
+                num_positions=block_size,
+                device=self._confidence_logits.device,
+            )
+            logger.info(
+                "DSpark confidence scheduling: the checkpoint has no confidence-head "
+                "weights; per-position acceptance is estimated online from the draft logits."
             )
         if calibration_path and head is not None:
             # Accepts either key spelling ("sts_temperatures" here,
@@ -1000,6 +1019,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 # reset to neutral so the first scheduling decision verifies
                 # the full block.
                 self._confidence_logits[slot].fill_(_NEUTRAL_CONFIDENCE_LOGIT)
+            if self._acceptance_estimator is not None:
+                # The previous occupant's last block was never verified.
+                self._acceptance_estimator.clear_row(slot)
         return self._req_to_slot[req_id]
 
     def _clear_slot(self, slot: int) -> None:
@@ -1446,6 +1468,19 @@ class DSv4DSparkWorker(SpecWorkerBase):
             )
             bonus_x = projected[:, K]
 
+        estimator = self._acceptance_estimator
+        if estimator is not None:
+            # Grade the block these requests just verified, before this step's
+            # scores replace its features. A ragged window counts the anchor
+            # token; a uniform step scores every draft.
+            verify_lens = spec_metadata.verify_lens
+            estimator.observe(
+                slots,
+                num_accepted_tokens[num_contexts:batch_size] - 1,
+                spec_metadata.runtime_draft_len if verify_lens is None else verify_lens - 1,
+                slots != self._scratch_slot,
+            )
+
         # Keep the full padded generation batch and all window updates in either
         # path. Token reuse bypasses only corrected-logit collection and sampling.
         draft_output = draft_model.forward_batched(
@@ -1457,7 +1492,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
             valid_len=valid_len,
             temperature=0.0,
             return_confidence=self.return_confidence,
-            return_logits=not return_tokens,
+            return_logits=not return_tokens or estimator is not None,
             all_rank_num_tokens=all_rank_num_tokens,
             main_x=bonus_x,
         )
@@ -1466,6 +1501,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
         # captured graph keeps the same storage), and scattered through
         # ``slots`` so a replay lands on the current batch's slots.
         confidence = draft_output[1]
+        if estimator is not None:
+            # The block is drafted greedily, so its logits need no temperature.
+            confidence = estimator.predict(draft_output[2], slots)
         if confidence is not None:
             # Padding may write the same scratch slot repeatedly; its content
             # is undefined and must never be consumed as a real confidence row.
@@ -1485,10 +1523,12 @@ class DSv4DSparkWorker(SpecWorkerBase):
             # must not reach the verification planner.
             None if self._confidence_logits is None else self._confidence_logits.clone(),
             None if self._confidence_stamp is None else self._confidence_stamp.clone(),
+            # Warmup verdicts and scores must not reach the acceptance fit.
+            None if self._acceptance_estimator is None else self._acceptance_estimator.snapshot(),
         )
 
     def _restore_persistent_state(self, saved: tuple) -> None:
-        ctx_len, valid_len, position_initialized, windows, confidence, stamp = saved
+        ctx_len, valid_len, position_initialized, windows, confidence, stamp, estimator = saved
         self._ctx_len.copy_(ctx_len)
         self._valid_len.copy_(valid_len)
         self._position_initialized.copy_(position_initialized)
@@ -1497,6 +1537,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._confidence_logits.copy_(confidence)
         if stamp is not None:
             self._confidence_stamp.copy_(stamp)
+        if estimator is not None:
+            self._acceptance_estimator.restore(estimator)
 
     @staticmethod
     def _all_rank_draft_tokens(
@@ -1659,6 +1701,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
             )
         elif max(spec_metadata.all_rank_num_gens) > 0:
             draft_model.run_moe_lockstep_noop(all_rank_draft_tokens, logits.device)
+
+        if self._acceptance_estimator is not None and num_gens > 0:
+            # No block is proposed from this step, so none is verified next step.
+            self._acceptance_estimator.discard(self._batch_to_slot[num_contexts:batch_size])
 
         if saved_state is not None:
             self._restore_persistent_state(saved_state)

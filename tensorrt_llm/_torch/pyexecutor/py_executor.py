@@ -5230,6 +5230,7 @@ class PyExecutor:
         if buffer is None:
             return
         worker.bump_draft_seq()
+        worker.advance_acceptance_estimator()
         planner.stage_confidence(buffer)
 
     def _dspark_confidence_draft_len(self,

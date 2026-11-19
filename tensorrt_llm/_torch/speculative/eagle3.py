@@ -22,9 +22,12 @@ from ..model_config import ModelConfig
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.multi_stream_utils import do_multi_stream
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
-from ..pyexecutor.llm_request import LlmRequest
+from ..pyexecutor.llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
+                                      LlmRequest)
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
+from .confidence_schedule import (ConfidenceScheduledWorkerMixin,
+                                  ConfidenceScheduleState)
 from .fused_accept import step0_epilogue
 from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, DraftRowPick,
                         SpecMetadata, SpecWorkerBase,
@@ -32,6 +35,7 @@ from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, DraftRowPick,
 from .kept_rows import (DraftKeptRows, generation_only_on_every_rank,
                         kept_row_ids)
 from .mtp import _select_mtp_position_ids
+from .ragged_helpers import row_ids_from_lens
 from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
 from .vocab_parallel import is_vocab_sharded_lm_head
@@ -259,6 +263,9 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None
     retrieve_parent_token: Optional[torch.Tensor] = None
+    # The worker's confidence-scheduling state, set in its forward; prepare()
+    # maps each step's requests to their confidence slots through it.
+    confidence_state: Optional[ConfidenceScheduleState] = None
     # prepare()'s uploads into batch_indices_cuda / slot_ids, skipped when the
     # buffer already holds the values (every writer of a batch-index buffer
     # writes arange(n)).
@@ -387,6 +394,11 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
             self._slot_ids_upload.update(
                 torch.tensor(eagle_slot_ids, dtype=torch.int))
 
+        if self.confidence_state is not None:
+            self.confidence_state.assign_batch(
+                self.request_ids,
+                getattr(self, "paused_in_place_ids", frozenset()))
+
         sa_manager = getattr(self.spec_resource_manager, 'sa_manager', None)
         if sa_manager is not None:
             gen_request_ids = self.request_ids[num_seqs - self.num_generations:]
@@ -449,7 +461,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                 break
 
 
-class Eagle3OneModelWorker(SpecWorkerBase):
+class Eagle3OneModelWorker(ConfidenceScheduledWorkerMixin, SpecWorkerBase):
     """Unified one-model worker for Eagle3 and MTP Eagle speculative decoding.
 
     The operating mode is determined by ``spec_config.spec_dec_mode``:
@@ -494,6 +506,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         # Mode flag: True = MTP Eagle one-model, False = Eagle3 one-model.
         self.is_mtp_eagle = spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+        # Read once so a captured graph cannot diverge from the config.
+        self._confidence_scheduling = bool(
+            getattr(spec_config, "enable_confidence_scheduling", False))
 
         # SA enhancer (common to both modes)
         self.sa_enhancer: Optional[SADraftEnhancer] = None
@@ -581,6 +596,57 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 and type(draft_model.logits_processor) is LogitsProcessor
                 and is_vocab_sharded_lm_head(draft_model.lm_head))
 
+    def _confidence_state(self, spec_metadata: SpecMetadata,
+                          device: torch.device
+                          ) -> Optional[ConfidenceScheduleState]:
+        """The confidence-scheduling state, built on the first forward.
+
+        Also hands it to ``spec_metadata``, whose prepare() maps requests to
+        confidence slots before each later forward or graph replay.
+        """
+        if not self._confidence_scheduling:
+            return None
+        if self._confidence is None:
+            # Import here to avoid a circular import.
+            from ..pyexecutor.cuda_graph_runner import \
+                CUDA_GRAPH_DUMMY_REQUEST_ID
+
+            # CUDA graph padding requests take the highest request ids.
+            dummy_id_floor = CUDA_GRAPH_DUMMY_REQUEST_ID - 2 * (
+                self.spec_config.max_total_draft_tokens + 1) + 1
+            self._confidence = ConfidenceScheduleState(
+                num_slots=spec_metadata.num_seq_slots,
+                max_draft_len=self.max_draft_len,
+                device=device,
+                device_windows=bool(
+                    self.spec_config.enable_fused_confidence_scheduler),
+                is_dummy_request_id=lambda request_id:
+                (request_id == ATTENTION_DP_DUMMY_REQUEST_ID or request_id >=
+                 dummy_id_floor))
+            logger.info(
+                "Confidence scheduling: per-position acceptance is estimated "
+                "online from the draft logits.")
+        if (spec_metadata.confidence_state is None
+                and not torch.cuda.is_current_stream_capturing()):
+            # This metadata's prepare() ran before it had the state.
+            self._confidence.assign_batch(
+                spec_metadata.request_ids,
+                getattr(spec_metadata, "paused_in_place_ids", frozenset()))
+        spec_metadata.confidence_state = self._confidence
+        return self._confidence
+
+    def _publish_verify_windows(self, outputs, spec_metadata, num_contexts,
+                                num_gens) -> None:
+        """Report the verification windows this forward executed to the sampler."""
+        # Import here to avoid a circular import.
+        from .dspark import _publish_policy_window_output
+        _publish_policy_window_output(
+            outputs,
+            spec_metadata.verify_lens,
+            num_contexts=num_contexts,
+            num_generations=num_gens,
+            output_verify_lens=self._confidence.output_verify_lens)
+
     def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
         attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
         batch_size = attn_metadata.num_seqs
@@ -643,15 +709,30 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                       resource_manager=None):
 
         runtime_draft_len = spec_metadata.runtime_draft_len
-        # skip the draft forward if the runtime draft length is 0
-        if runtime_draft_len == 0:
-            return self.skip_drafting(input_ids, position_ids, hidden_states,
-                                      logits, attn_metadata, spec_metadata,
-                                      draft_model)
-
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
+        confidence = self._confidence_state(spec_metadata, logits.device)
+        # A CUDA graph warmup pass runs synthetic batches, which must not
+        # reach the acceptance fit or the staged confidence.
+        saved_confidence = (
+            confidence.snapshot() if confidence is not None
+            and spec_metadata.is_cuda_graph
+            and not torch.cuda.is_current_stream_capturing() else None)
+
+        # skip the draft forward if the runtime draft length is 0
+        if runtime_draft_len == 0:
+            outputs = self.skip_drafting(input_ids, position_ids, hidden_states,
+                                         logits, attn_metadata, spec_metadata,
+                                         draft_model)
+            if confidence is not None:
+                # No block is proposed, so none is verified next step.
+                confidence.discard(confidence.batch_rows(batch_size))
+                if saved_confidence is not None:
+                    confidence.restore(saved_confidence)
+                self._publish_verify_windows(outputs, spec_metadata,
+                                             num_contexts, num_gens)
+            return outputs
 
         raw_logits = logits
 
@@ -661,6 +742,16 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # acceptance path (scans for thinking-phase tokens); ignored otherwise.
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             input_ids, logits, attn_metadata, spec_metadata)
+
+        if confidence is not None and num_gens > 0:
+            # Grade the block the generation requests just verified, before
+            # the draft loop scores the next one. A ragged window counts the
+            # anchor token; a uniform step scores every draft.
+            verify_lens = spec_metadata.verify_lens
+            confidence.observe(
+                confidence.batch_rows(batch_size)[num_contexts:],
+                num_accepted_tokens[num_contexts:],
+                runtime_draft_len if verify_lens is None else verify_lens - 1)
 
         # Mamba hybrid models need state updates after token acceptance because
         # the accepted token count affects which Mamba states are valid. The
@@ -777,13 +868,19 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 num_contexts,
             )
 
-        return {
+        outputs = {
             'logits': raw_logits,
             'new_tokens': accepted_tokens,
             'new_tokens_lens': num_accepted_tokens,
             'next_draft_tokens': next_draft_tokens,
             'next_new_tokens': next_new_tokens,
         }
+        if confidence is not None:
+            if saved_confidence is not None:
+                confidence.restore(saved_confidence)
+            self._publish_verify_windows(outputs, spec_metadata, num_contexts,
+                                         num_gens)
+        return outputs
 
     def _forward_external_shared_target_kv_draft_loop(
         self,
@@ -927,12 +1024,17 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         runtime_draft_len = spec_metadata.runtime_draft_len
         num_gens = batch_size - num_contexts
         next_draft_tokens = []
+        confidence = self._confidence
+        # Generation requests verify windows of their own lengths. The fused
+        # step-0 paths below index rows by one uniform stride, so such a step
+        # takes the plain path.
+        ragged = spec_metadata.is_ragged_verify
         # MTP Eagle: step 0's gather ids, hidden rows, later positions and
         # step-0 -> 1 metadata update in one launch (the step-0 epilogue). It
         # reads the pre-loop sequence lengths, since it writes the live ones.
         use_epilogue = (pre_draft_seq_lens is not None and self.is_mtp_eagle
                         and self.spec_decode_fast_paths
-                        and self.guided_decoder is None
+                        and self.guided_decoder is None and not ragged
                         and hasattr(attn_metadata, "kv_lens_cuda"))
         step0 = None
         # [k + 1, b] int32 token buffer of an epilogue step: row 0 = each
@@ -955,8 +1057,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # Sparse backends that can reuse one indexer selection across the draft
         # loop expose this setter; each indexer still decides whether its own
         # config turns the reuse on.
-        uses_mtp_index_share = self.is_mtp_eagle and isinstance(
-            attn_metadata, MTPIndexShareMetadata)
+        uses_mtp_index_share = (self.is_mtp_eagle and not ragged
+                                and isinstance(attn_metadata,
+                                               MTPIndexShareMetadata))
         with contextlib.ExitStack() as draft_scope:
             if uses_mtp_index_share:
                 attn_metadata.set_in_mtp_draft_loop(True)
@@ -984,6 +1087,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # refresh once more after rebinding so the first draft forward
                 # writes the separate DSA indexer cache at the same positions.
                 attn_metadata.on_update_kv_lens()
+            if ragged and draft_kv_cache_manager is not None:
+                # The per-token block table was expanded from the target
+                # cache's offsets; step 0 reads and writes the draft cache.
+                attn_metadata.refresh_token_major_block_table()
             for i in range(runtime_draft_len):
                 if uses_mtp_index_share:
                     attn_metadata.set_skip_topk(i > 0)
@@ -995,7 +1102,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # post-attention collectives get the per-request counts the
                 # later steps use.
                 pick_rows = None
-                if i == 0 and self._step0_draft_layer_picks_rows(
+                if i == 0 and not ragged and self._step0_draft_layer_picks_rows(
                         draft_model, use_epilogue):
                     # set_spec_metadata_all_rank_num_tokens sets both.
                     assert (spec_metadata.all_rank_num_tokens is None
@@ -1018,7 +1125,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # step-0 rows; it never also takes pick_rows.
                 kept_rows = None
                 if (i == 0 and self._draft_takes_kept_rows and pick_rows is None
-                        and self.guided_decoder is None):
+                        and self.guided_decoder is None and not ragged):
                     kept_rows = self._draft_kept_rows(
                         spec_metadata, step0_seq_lens, num_accepted_tokens,
                         num_contexts, num_gens, runtime_draft_len,
@@ -1114,13 +1221,18 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # for the group-sync semantics).
                 advanced_draft_sampling = (
                     spec_metadata.wants_advanced_draft_sampling)
+                # The acceptance estimator scores each request's full-vocab
+                # draft distribution, so it takes the same route to the logits
+                # as advanced sampling.
+                needs_full_vocab_logits = (advanced_draft_sampling
+                                           or confidence is not None)
                 # enable_lm_head_tp_in_adp implies enable_attention_dp
                 # (asserted in Mapping.__init__); no separate ADP check.
                 lm_head_tp_in_adp_configured = (
                     self.is_mtp_eagle and self.model_config is not None
                     and self.model_config.mapping.enable_lm_head_tp_in_adp)
                 use_lm_head_tp_in_adp = (lm_head_tp_in_adp_configured
-                                         and not advanced_draft_sampling)
+                                         and not needs_full_vocab_logits)
                 # Greedy draft tokens straight from the MXFP8 draft head
                 # (streaming GEMV + fused shard argmax + key exchange); no
                 # draft logits are materialized.
@@ -1129,7 +1241,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # of the draft head, for the greedy sampler.
                 draft_logits_are_shard = None
                 if (self.is_mtp_eagle and not lm_head_tp_in_adp_configured
-                        and not advanced_draft_sampling
+                        and not needs_full_vocab_logits
                         and self.guided_decoder is None and self._d2t is None
                         and self.draft_head is not None
                         and self.draft_head.supports(
@@ -1189,7 +1301,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                             request_hidden_states, draft_model.lm_head,
                             attn_metadata, True)
                 elif self._draft_head_shards(draft_model,
-                                             advanced_draft_sampling):
+                                             needs_full_vocab_logits):
                     # This rank's vocab shard of the draft logits; the greedy
                     # sampler takes the global argmax across the TP group and
                     # then applies d2t.
@@ -1219,6 +1331,17 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     # greedy_sample_draft_with_tp_gather combine the group's vocab
                     # shards and slice this rank's own row segment; only then trim
                     # the max_num_requests padding down to token_count.
+                    if confidence is not None:
+                        if self._draft_logits_are_sharded(logits, spec_metadata):
+                            # Plain TP: every rank holds the same rows and one
+                            # shard of the vocabulary.
+                            from ..distributed.ops import allgather
+                            logits = allgather(logits, self.mapping, dim=-1)
+                        # Drafts are greedy here, so the logits need no
+                        # temperature.
+                        confidence.score_step(
+                            logits, confidence.batch_rows(batch_size), i)
+
                     mapping_lm_head_tp = None
                     if use_lm_head_tp_in_adp:
                         # The MTP head built this per-forward mapping when producing
@@ -1272,6 +1395,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
                 # Update attn_metadata for the next iteration.
                 if i == 0:
+                    if ragged:
+                        # Every later pass submits one token per request.
+                        draft_scope.callback(
+                            attn_metadata.resume_ragged_verification,
+                            attn_metadata.suspend_ragged_verification())
                     attn_metadata._seq_lens[:batch_size].fill_(1)
                     if step0 is None:  # else: done by the step-0 epilogue
                         attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
@@ -1285,9 +1413,12 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     if has_kv_cache:
                         attn_metadata.num_contexts = 0
                     if hasattr(attn_metadata, 'kv_lens_cuda') and step0 is None:
+                        # Drop the rejected drafts of the window each request
+                        # verified; the next pass appends one token.
+                        num_verified = (spec_metadata.verify_lens -
+                                        1 if ragged else runtime_draft_len)
                         attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
-                            runtime_draft_len -
-                            num_accepted_tokens[num_contexts:])
+                            num_verified - num_accepted_tokens[num_contexts:])
                         attn_metadata.kv_lens_cuda[:num_contexts] += 1
 
                     if has_kv_cache:
@@ -1339,8 +1470,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         """Step 0's row of each request: a context request's last prompt row,
         a generation request's last accepted row."""
         last_tokens_idx = torch.cumsum(seq_lens, dim=0, dtype=torch.long) - 1
-        start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
-                         (runtime_draft_len + 1)).long()
+        if spec_metadata.is_ragged_verify:
+            start_ids_gen = spec_metadata.qo_indptr[:num_gens].long()
+        else:
+            start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
+                             (runtime_draft_len + 1)).long()
         gather_ids_gen = (start_ids_gen + num_accepted_tokens[num_contexts:] -
                           1 + num_ctx_tokens)
         return torch.concat([last_tokens_idx[:num_contexts], gather_ids_gen],
@@ -1513,9 +1647,14 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # use runtime_draft_len for dynamic draft length support.
         if logits.dim() == 1:
             logits = logits.unsqueeze(0)
-        draft_tokens = spec_metadata.draft_tokens.reshape(
-            num_gens, runtime_draft_len) if num_gens > 0 else torch.empty(
-                0, runtime_draft_len, dtype=torch.int, device=logits.device)
+        if spec_metadata.is_ragged_verify:
+            # Packed by per-request windows, not a rectangle.
+            draft_tokens = self._reshape_draft_tokens_for_accept(
+                spec_metadata, num_gens, logits.device)
+        else:
+            draft_tokens = spec_metadata.draft_tokens.reshape(
+                num_gens, runtime_draft_len) if num_gens > 0 else torch.empty(
+                    0, runtime_draft_len, dtype=torch.int, device=logits.device)
         return self._accept_draft_tokens(logits, draft_tokens, num_contexts,
                                          batch_size, spec_metadata)
 
@@ -1560,8 +1699,12 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         )
 
         # generation
-        input_ids_gen = accepted_tokens[
-            num_contexts:, :spec_metadata.runtime_draft_len + 1].flatten()
+        if spec_metadata.is_ragged_verify:
+            input_ids_gen = self._ragged_generation_input_ids(
+                accepted_tokens[num_contexts:], spec_metadata)
+        else:
+            input_ids_gen = accepted_tokens[
+                num_contexts:, :spec_metadata.runtime_draft_len + 1].flatten()
 
         # get draft inputs; on the fast paths a generation-only batch reads the
         # accepted tokens in place (the loop never writes them).
@@ -1577,6 +1720,21 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             "attn_metadata": attn_metadata,
             "spec_metadata": spec_metadata,
         }
+
+    @staticmethod
+    def _ragged_generation_input_ids(accepted_tokens: torch.Tensor,
+                                     spec_metadata: SpecMetadata
+                                     ) -> torch.Tensor:
+        """Step 0's draft input of generation requests that verified windows
+        of their own lengths: the first ``verify_lens[r]`` tokens of request
+        ``r``'s row of ``accepted_tokens`` ``[G, K + 1]``, packed in request
+        order like the target's rows."""
+        verify_lens = spec_metadata.verify_lens
+        total = spec_metadata.total_verify_tokens
+        requests = row_ids_from_lens(verify_lens, total=total)
+        offsets = (torch.arange(total, device=requests.device) -
+                   spec_metadata.qo_indptr.long()[requests])
+        return accepted_tokens[requests, offsets]
 
     def _prepare_shared_kv_draft_inputs(
         self,
